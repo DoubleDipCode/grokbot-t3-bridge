@@ -4,6 +4,10 @@ Connect Grok Bot agents to [T3 Code](https://t3.codes) ([source](https://github.
 
 T3 Code is a desktop app that runs coding agents such as Codex and Claude Code in threads, each in its own git worktree. Grok Bot can drive it through T3's remote MCP connector: list projects, launch a thread with a brief, read it, reply to it. This repo covers that setup, plus a small hook that tells the right bot when a coding turn ends.
 
+## Don't want to run our scripts? Have your bot build it
+
+You don't have to trust the code in this repo. [ONE-SHOT-PROMPT.md](ONE-SHOT-PROMPT.md) is a single prompt you can paste into your own Grok Bot, or any agent with shell access to your T3 machine. It describes the whole setup as a spec, so your agent writes its own version, shows you every file before installing, and leaves the secrets for you to enter yourself.
+
 ## The problem
 
 Without a callback, a bot that launches a T3 thread has no way to know when the work is done. In practice ours ended up waiting on threads in 10-minute stretches and re-reading the thread activity each time. That burned tokens on reading the same messages over and over, and it still missed stalls: a thread that stopped to ask a question could sit for a long time before anyone noticed.
@@ -64,6 +68,7 @@ To remove the hook entries later, run `./uninstall.sh`.
 
 ```
 README.md                 this file
+ONE-SHOT-PROMPT.md        paste-in prompt for building your own version from scratch
 install.sh                installs the hook for Codex and Claude Code (idempotent)
 uninstall.sh              removes the hook entries again
 hooks/notify.sh           the Stop hook: reads marker + status, POSTs to the bot

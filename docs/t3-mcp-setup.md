@@ -46,23 +46,37 @@ A typical launch for bot work:
 
 ```json
 {
+  "title": "Add CSV export to reports",
+  "message": "<the brief, ending with templates/brief-footer.md>",
   "projectId": "<from t3_project_list>",
   "runtimeMode": "full-access",
   "workspaceStrategy": { "type": "worktree", "baseRef": "main" },
-  "modelSelection": "<from orchestrator_capabilities, if the project has no default>",
-  "clientRequestId": "<a unique id the bot generates for this launch>",
-  "prompt": "<the brief, ending with templates/brief-footer.md>"
+  "modelSelection": {
+    "provider": "<provider>",
+    "instanceId": "<provider instance>",
+    "model": "<model>"
+  },
+  "clientRequestId": "<a unique id the bot generates for this launch>"
 }
 ```
 
-Notes:
+Fields:
+
+| Field | Notes |
+| --- | --- |
+| `title` | Required. Shown in T3's thread list. |
+| `message` | The brief. End it with [templates/brief-footer.md](../templates/brief-footer.md). |
+| `projectId` or `scratch` | Run in a project from `t3_project_list`, or use `scratch` for a throwaway thread with no project (handy for testing the hook). |
+| `runtimeMode` | `approval-required`, `auto-accept-edits`, `auto` or `full-access`. Use `full-access` for bot work. |
+| `interactionMode` | Optional. |
+| `workspaceStrategy` | `type` is `root` (the project folder itself), `existing_worktree`, or `worktree` (a new worktree). Also takes `branch`, `baseRef` and related options. |
+| `modelSelection` | `{provider, instanceId, model}`. Required when the project has no default model. `orchestrator_capabilities` lists what is available. |
+| `clientRequestId` | Makes retries safe. If the launch call times out and the bot retries with the same id, T3 does not start a second thread. |
+
+Why these choices:
 
 - **`runtimeMode: "full-access"`** lets the agent run without stopping on permission prompts. A bot cannot answer those prompts, and a thread stuck on one never ends its turn, so it never calls back.
-- **`workspaceStrategy`** with `type: "worktree"` gives each thread its own git worktree and branch, based on `baseRef`. The `.grokbot` marker lives in that worktree, which is how the hook knows which bot to call.
-- **`modelSelection`** is required when the project has no default model. Call `orchestrator_capabilities` to see which providers and models are available.
-- **`clientRequestId`** makes retries safe. If the launch call times out and the bot retries with the same id, T3 does not start a second thread.
-
-Field names other than the ones above (for example the name of the brief field) can differ between T3 versions. Check the tool schema your connector shows.
+- **`workspaceStrategy` with `type: "worktree"`** gives each thread its own git worktree and branch, based on `baseRef`. The `.grokbot` marker lives in that worktree, which is how the hook knows which bot to call, and your own checkout is never touched.
 
 ### Reading a thread cheaply
 
