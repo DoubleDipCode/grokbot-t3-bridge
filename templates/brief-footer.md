@@ -26,3 +26,7 @@ printf 'needs_input\nShould the export include archived rows? Options: (a) yes, 
 ```
 
 **If you need a decision, write `needs_input` and end your turn.** Do not wait inside the thread for an answer. The answer will come as a new message in this thread.
+
+**Never remove this worktree yourself,** not even at the end. Do not run `git worktree remove` on it or delete its folder. Cleanup happens after your final turn.
+
+**Stay on this task in this worktree.** If you are asked to start an unrelated task, say so and end the turn with `needs_input`. It needs a new thread.

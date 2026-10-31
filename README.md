@@ -88,6 +88,8 @@ templates/brief-footer.md     text to append to every brief sent to T3
 
 **The agent writes its status to a file.** Before ending each turn the agent overwrites `.grokbot-status` with `done`, `needs_input` or `failed` on the first line and a short note below. The script reads that file. It does not parse harness transcripts, which differ between harnesses and change between versions.
 
+**It survives a removed or switched worktree.** Every run that finds a marker records the worktree and bot in `~/.grokbot-hooks/markers.tsv`. If a later turn ends in a known worktree whose marker is gone, the bot is still notified, with the status `worktree_missing`. Runs with no marker and no record are always logged as `no-marker <path>`, so a missed callback shows up in the log instead of failing silently.
+
 **The hook fires whether or not the agent remembers.** The hook is run by the harness, not by the agent. If the agent forgets to write a status, the payload says `turn_ended_no_status` and the bot reads the thread to find out what happened. You still get woken up.
 
 **One webhook and one key per bot.** Each bot has its own routine, URL and key, stored in its own `~/.grokbot-hooks/<bot>.env`. The marker names the bot, so the callback goes to the bot that launched the thread and no other.
@@ -96,12 +98,16 @@ templates/brief-footer.md     text to append to every brief sent to T3
 
 **A quiet backup check.** If a turn never ends, because the harness crashed or the machine went offline, no hook fires. Each bot keeps a low-frequency backup check (for example every hour or two) that looks at its open threads and stays silent unless something is stuck.
 
+**One thread per task, and threads don't delete their own worktree.** A harness session keeps the working directory it started in. If you reuse a thread for a new task in a new worktree, its turns still end in the old path, so the hook looks for the marker in the wrong place. And a thread that runs `git worktree remove` on its own worktree deletes the marker before its turn ends. The bot removes the worktree after the thread's final turn instead. See [docs/grokbot-side.md](docs/grokbot-side.md).
+
 **Use full-access threads for bot work.** A thread in approval-required mode that stops on a permission prompt has not ended its turn, so the hook does not fire and the bot cannot approve the prompt either. Bots should launch full-access threads in a worktree. If a thread must be approval-required, a human has to watch it in T3.
 
 ## Limits
 
 - The hook only tells you that a turn ended. Everything else comes from reading the thread through the MCP.
 - `last_message` is filled for Codex, which passes `last_assistant_message` to the hook. Other harnesses may leave it empty.
+- `worktree_missing` only works for worktrees the hook has seen with a marker at least once. A worktree removed before its first turn ended is reported as `no-marker`, and only the backup check finds it.
+- `notify.log` now gets a `no-marker` line for every turn of your own sessions too. It is rotated once at about 1 MB (`notify.log.1`), so it stays small.
 - The script sends the callback in the background and does not retry. If the POST fails, `notify.log` shows `http=000` or the error code, and the backup check catches the thread later.
 
 ## License

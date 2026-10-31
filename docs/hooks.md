@@ -70,14 +70,27 @@ There is no trust step. `last_message` may be empty for Claude Code.
 
 1. Reads the hook JSON from stdin and takes `cwd` from it (falls back to the current directory).
 2. Finds the git worktree root for that directory.
-3. If there is no `.grokbot` file at the root, exits. Nothing is sent and nothing is logged (unless debug is on).
-4. Reads the bot name from the first line of `.grokbot`. Only `a-z`, `0-9`, `-` and `_` are kept, so the name can only point at a file inside `~/.grokbot-hooks`.
-5. Reads up to 2000 bytes of `.grokbot-status`, or uses `turn_ended_no_status` if the file is missing.
-6. Writes one line to `~/.grokbot-hooks/notify.log`.
-7. Loads `~/.grokbot-hooks/<bot>.env`. If it is missing, stops here.
-8. POSTs the payload in the background with a 10-second timeout, and logs the HTTP status code.
+3. If there is a `.grokbot` file at the root:
+   - Reads the bot name from its first line. Only `a-z`, `0-9`, `-` and `_` are kept, so the name can only point at a file inside `~/.grokbot-hooks`.
+   - Records `worktree<TAB>bot` in `~/.grokbot-hooks/markers.tsv` (mode 600, one line per worktree, at most 500 lines, rewritten only when something changed).
+   - Reads up to 2000 bytes of `.grokbot-status`, or uses `turn_ended_no_status` if the file is missing.
+4. If there is no `.grokbot` file:
+   - If `markers.tsv` has an entry for this exact path, the worktree was removed or the session is running in an old path. It uses that bot and the status `worktree_missing <path> ...`.
+   - Otherwise it logs `no-marker <path>` and exits. Nothing is sent.
+5. Writes one line to `~/.grokbot-hooks/notify.log`.
+6. Loads `~/.grokbot-hooks/<bot>.env`. If it is missing, stops here.
+7. POSTs the payload in the background with a 10-second timeout, and logs the HTTP status code.
 
-It never prints to stdout and always exits 0, so it cannot block or change the agent's turn.
+It never prints to stdout and always exits 0, so it cannot block or change the agent's turn. It also rotates `notify.log` once it passes about 1 MB.
+
+### Why the marker map exists
+
+Two real failures led to `markers.tsv`:
+
+1. **A thread removed its own worktree during cleanup.** When that turn ended, the `.grokbot` marker was already gone, so no callback fired.
+2. **A thread was reused for a new task in a new worktree.** The harness session's working directory stayed on the old, deleted path, so the hook never saw the new marker.
+
+Both were silent, because a no-marker run was only logged in debug mode. Now the hook remembers every marked worktree, still reports a known one as `worktree_missing`, and always logs unknown no-marker runs. The two working rules in [grokbot-side.md](grokbot-side.md) keep these cases rare in the first place.
 
 ## Payload
 
@@ -101,26 +114,38 @@ It never prints to stdout and always exits 0, so it cannot block or change the a
 | `harness` | The argument the hook was called with: `codex`, `claude`, or `unknown`. |
 | `worktree` | Absolute path of the worktree root. |
 | `branch` | Current branch of the worktree. |
-| `status` | Contents of `.grokbot-status` (first line `done`, `needs_input` or `failed`, then a note), or `turn_ended_no_status`. |
+| `status` | See the status table below. |
 | `last_message` | Codex: `last_assistant_message` from the hook input. May be empty for other harnesses. |
 | `ended_at` | Local time the hook ran, with UTC offset. |
+
+### Status values
+
+| First word of `status` | Meaning |
+| --- | --- |
+| `done` | The agent says the work is finished. The rest is its note, usually with the PR URL. |
+| `needs_input` | The agent needs a decision. The rest is the question and options. |
+| `failed` | The agent is stuck. The rest says what blocked it. |
+| `turn_ended_no_status` | The worktree has a marker but no `.grokbot-status`. Read the thread. |
+| `worktree_missing` | The worktree is known from `markers.tsv` but has no marker now (removed, or the session's cwd is an old path). The full text is `worktree_missing worktree <path> no longer has a .grokbot marker (deleted or moved); read the thread for its real state`. `branch` is usually empty. Read the thread. |
 
 Request headers: `Content-Type: application/json` and, if set, `Authorization: <value from set-webhook.sh>`.
 
 ## Testing and debugging
 
-Turn on debug logging, which also logs turns in worktrees without a marker:
+Watch the log while a thread runs:
 
 ```bash
-touch ~/.grokbot-hooks/debug
 tail -f ~/.grokbot-hooks/notify.log
 ```
+
+Turns in folders with no marker and no entry in `markers.tsv` are always logged as `no-marker <path>`. The `debug` file from earlier versions is no longer needed.
 
 What the log lines mean:
 
 | Line | Meaning |
 | --- | --- |
-| `... codex no-marker /path` | Hook ran, but the worktree has no `.grokbot`. Only logged in debug mode. |
+| `... codex no-marker /path` | Hook ran, but the folder has no `.grokbot` and is not in `markers.tsv`. Normal for your own sessions. For a bot thread, it means the marker was never written, or the session is in a path the hook has never seen. |
+| `... status=worktree_missing worktree /path ...` | Known worktree, marker gone. The bot was notified and should read the thread. |
 | `... codex bot=codexbot branch=... status=done` | Hook ran in a bot worktree. |
 | `... codexbot webhook http=200` | Callback delivered. |
 | `... codexbot webhook http=401` | Wrong or missing Authorization value. Run `set-webhook.sh` again. |
@@ -138,8 +163,10 @@ tail -n 2 ~/.grokbot-hooks/notify.log
 
 This sends a real callback, so the bot will wake up.
 
-Remove debug mode when you are done:
+To see which worktrees the hook knows about:
 
 ```bash
-rm ~/.grokbot-hooks/debug
+cat ~/.grokbot-hooks/markers.tsv
 ```
+
+It is safe to delete this file. It is rebuilt as marked worktrees end turns.

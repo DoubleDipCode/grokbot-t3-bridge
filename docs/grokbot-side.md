@@ -39,9 +39,17 @@ Every brief the bot sends with `t3_thread_launch` ends with [templates/brief-foo
 
 Launch with `runtimeMode: "full-access"` and a worktree workspace. See [t3-mcp-setup.md](t3-mcp-setup.md).
 
+## Two working rules
+
+**One thread per task. Never reuse a thread in a new worktree.** A harness session keeps the working directory it was started in. If a bot sends a finished thread a new task and the agent moves to a new worktree, its turns still end with the old path as `cwd`. The hook looks for the marker in the old, often deleted, path and never sees the new one. Launch a new thread for each task instead.
+
+**A thread never removes its own worktree.** If the agent runs `git worktree remove` on its own worktree, the `.grokbot` marker is gone before the turn ends. The bot removes the worktree after the thread's final turn, as described under cleanup below.
+
+The hook has a fallback for both cases: it remembers every marked worktree in `~/.grokbot-hooks/markers.tsv` and reports a known worktree without a marker as `worktree_missing`. That fallback only tells the bot that something ended. Following the rules keeps the normal `done` / `needs_input` / `failed` status working.
+
 ## 3. A quiet backup check
 
-The hook only fires when a turn ends. If the harness crashes, the machine sleeps or goes offline, or a thread is stuck on a permission prompt, nothing is sent.
+The hook only fires when a turn ends. If the harness crashes, the machine sleeps or goes offline, or a thread is stuck on a permission prompt, nothing is sent. A worktree removed before its first turn ended is also invisible to the hook.
 
 Give each bot a low-frequency scheduled routine, for example every one or two hours, that:
 
@@ -53,10 +61,19 @@ Keep it infrequent. It is a safety net, not a replacement for the hook.
 
 ## 4. Cleanup after merge
 
-Once you have merged the PR:
+Once the PR is merged and the coding thread has had its final turn, the bot cleans up. The coding thread itself does not do this (see the rules above).
 
-1. Remove the worktree: `git worktree remove <path>`
-2. Delete the branch, locally and on the remote if it is still there.
-3. Settle or archive the thread with `t3_thread_organize`.
+1. Launch a short cleanup thread in the project root (`workspaceStrategy: {"type": "root"}`), with no `.grokbot` marker, and a brief like:
+
+   ```text
+   Do not create a .grokbot file. Run:
+     git worktree remove <path>        (no --force: stop and report if it is not clean)
+     git branch -d <branch>            (lowercase -d: only deletes a merged branch)
+   Report what you did and end the turn.
+   ```
+
+   Because the cleanup thread has no marker and its folder is not in `markers.tsv`, its turn end is only logged as `no-marker`.
+2. Delete the remote branch if GitHub did not already.
+3. Settle or archive both threads with `t3_thread_organize`.
 
 Leaving old worktrees around also leaves old `.grokbot` markers around, and any later turn in them would wake the bot again.

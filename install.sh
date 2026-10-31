@@ -75,5 +75,5 @@ Next steps:
   2. For each bot, create a "T3 callback" webhook routine in Grok Bot, then run:
        $DEST/set-webhook.sh <bot-name>
      and paste the URL and the Authorization header value when asked.
-  3. Optional, while testing: touch $DEST/debug  (logs every turn to $DEST/notify.log)
+  3. While testing: tail -f $DEST/notify.log  (turns without a marker show up as no-marker)
 NEXT

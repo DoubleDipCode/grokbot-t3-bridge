@@ -2,6 +2,9 @@
 *.env
 .env*
 notify.log
+notify.log.1
+markers.tsv
+markers.??????
 debug
 *.bak-grokbot-*
 

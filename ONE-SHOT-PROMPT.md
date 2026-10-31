@@ -22,13 +22,22 @@ brief, a prompt, a log or a command line. I will enter them myself in a terminal
    - Takes the harness name as its first argument (codex, claude, ...). Default "unknown".
    - Reads the hook JSON from stdin. Takes "cwd" from it, falling back to $PWD.
    - Resolves the git top-level of that directory (falls back to the directory itself).
-   - If <toplevel>/.grokbot does not exist, exits 0 silently. This is how my own
-     sessions stay untouched. Optional: if ~/.grokbot-hooks/debug exists, log a
-     "no-marker" line first.
-   - Reads the bot name from the first line of .grokbot and strips everything except
-     a-z, 0-9, "-" and "_".
-   - Reads up to 2000 bytes of <toplevel>/.grokbot-status. If it is missing, uses the
-     status "turn_ended_no_status".
+   - If <toplevel>/.grokbot exists:
+     - Reads the bot name from its first line and strips everything except
+       a-z, 0-9, "-" and "_".
+     - Records "<toplevel><TAB><bot>" in ~/.grokbot-hooks/markers.tsv (mode 600).
+       Exact match on the path column, one line per worktree (replace, don't
+       duplicate), write via a temp file + mv, cap it at a few hundred lines.
+     - Reads up to 2000 bytes of <toplevel>/.grokbot-status. If it is missing, uses
+       the status "turn_ended_no_status".
+   - If there is no marker but markers.tsv has an exact entry for <toplevel>, the
+     worktree was removed or the session is running in an old path. Use that bot and
+     the status "worktree_missing worktree <toplevel> no longer has a .grokbot marker
+     (deleted or moved); read the thread for its real state".
+   - If there is no marker and no entry: always append "<time> <harness> no-marker
+     <toplevel>" to notify.log (no debug flag), then exit 0 without sending anything.
+     This is how my own sessions stay untouched while missed callbacks stay visible.
+     Rotate notify.log once when it passes about 1 MB.
    - Takes "last_assistant_message" from the stdin JSON if present (Codex sends it),
      up to 1500 bytes. Otherwise empty.
    - Appends one line to ~/.grokbot-hooks/notify.log: time, harness, bot, branch, and
@@ -71,6 +80,8 @@ brief, a prompt, a log or a command line. I will enter them myself in a terminal
       done: check the review ran and a PR exists, then send me the PR link.
       needs_input: answer from context you already have, or ask me.
       failed or turn_ended_no_status: read the latest messages, nudge or escalate.
+      worktree_missing: find the thread by the worktree path, read its latest
+      messages, and act on what they say.
       Never merge, deploy or delete anything without my OK."
    Then tell me to copy the routine's URL and Authorization header from the routine
    panel and run ~/.grokbot-hooks/set-webhook.sh <botname> in my own terminal.
@@ -85,14 +96,28 @@ brief, a prompt, a log or a command line. I will enter them myself in a terminal
      or what blocked you).
    - If a decision is needed, write needs_input and end the turn. Do not wait inside
      the thread.
+   - Never remove this worktree yourself, not even at the end.
+   - Stay on this task. If asked to start an unrelated one, write needs_input and end
+     the turn.
    Launch bot threads with runtimeMode "full-access" and a worktree workspace, because
    a thread stuck on a permission prompt never ends its turn and cannot call back.
+
+   Two working rules for you:
+   - One thread per task. Never reuse a thread for a new task in a new worktree: the
+     harness session keeps its original cwd, so the hook would look for the marker in
+     the old path and never see the new one.
+   - A thread never removes its own worktree, because that deletes the marker before
+     the turn ends. After the thread's final turn and once the PR is merged, remove it
+     yourself: a short cleanup thread in the project root with no marker, running
+     `git worktree remove <path>` (no --force, stop if not clean) and
+     `git branch -d <branch>`. Then settle the threads.
 
 8. Test
    After I have trusted the hook and stored the webhook, launch a small full-access
    scratch thread whose brief only writes the marker and a "done" status. Then check
    ~/.grokbot-hooks/notify.log for a status line followed by http=200, and confirm the
-   routine woke you. If it fails, use ~/.grokbot-hooks/debug to see whether the hook ran.
+   routine woke you. If it fails, look for a no-marker line in notify.log to see whether
+   the hook ran and which path it looked at.
 
 9. Backup check
    Set up a quiet scheduled check every one or two hours that looks at your open T3
