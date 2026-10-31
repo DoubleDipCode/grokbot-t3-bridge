@@ -50,6 +50,28 @@ brief, a prompt, a log or a command line. I will enter them myself in a terminal
    - POSTs it with curl in a detached background subshell, 10 second timeout,
      Content-Type: application/json, plus "Authorization: $GROKBOT_WEBHOOK_AUTH" if set.
      Logs only the HTTP status code to notify.log, never the URL, key or body.
+   - Use the leading status word: waiting skips; idle, milestone and done send;
+     needs_input and failed always send. Unknown words (including continuing,
+     turn_ended_no_status and worktree_missing) send for compatibility.
+   - Cache the last successful HTTP 2xx status per worktree under
+     ~/.grokbot-hooks/state/. Skip byte-identical payload statuses, except
+     needs_input and failed. Preserve trailing newlines within the 2000-byte cap.
+     Log skips with a reason. Failed sends must not advance this cache.
+   - For waiting, send "stale <status>" after 7200 seconds since the last successful
+     ping, or since first observed waiting if no ping exists. Reset the clock after
+     successful delivery. Stale reminders bypass dedupe and may recur each interval.
+   - Sweep known waiting worktrees and missing markers in the background on every
+     hook invocation. Also support notify.sh --sweep in the foreground without reading stdin
+     so launchd waits for completion. Use kernel-managed locks (Perl flock is
+     available on macOS); do not reclaim PID locks with racy deletion.
+     Serialize state changes and sends. Never block the harness on sweep/network work.
+   - Support GROKBOT_HOOKS_DIR, GROKBOT_STATE_DIR and GROKBOT_STALE_SECONDS overrides.
+     Add temp-directory-only tests with stub curl for waiting, idle, duplicate done,
+     repeated needs_input/failed, unknown status, stale sweep and clock reset.
+   - Provide an optional launchd plist example with --sweep and StartInterval 900,
+     an absolute script path placeholder and a PATH that includes Homebrew jq.
+     Do not install or load it without my explicit approval. Document copying it
+     into ~/Library/LaunchAgents after replacing the path, then launchctl load.
    - Never prints anything to stdout. Always exits 0.
 
 3. Helper: ~/.grokbot-hooks/set-webhook.sh <botname> (mode 700)
@@ -91,9 +113,9 @@ brief, a prompt, a log or a command line. I will enter them myself in a terminal
    - First step, at the worktree root:
        echo '<botname>' > .grokbot
        echo '.grokbot*' >> "$(git rev-parse --git-common-dir)/info/exclude"
-   - Before ending every turn, overwrite .grokbot-status. First line exactly one of
-     done, needs_input or failed, then a short note (PR URL, the question and options,
-     or what blocked you).
+   - Before ending every turn, overwrite .grokbot-status. Use waiting <what> only when a timer or webhook will wake
+     the thread; use idle, milestone <what>, done <PR URL>, needs_input <question>,
+     or failed <reason> for actionable updates.
    - If a decision is needed, write needs_input and end the turn. Do not wait inside
      the thread.
    - Never remove this worktree yourself, not even at the end.

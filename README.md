@@ -25,14 +25,14 @@ flowchart TD
     D --> E{.grokbot marker in worktree?}
     E -->|no| F[Do nothing]
     E -->|yes| G[Read bot name from .grokbot and status from .grokbot-status]
-    G -->|POST JSON| H[That bot's Grok Bot webhook routine]
+    G -->|Actionable or stale status: POST JSON| H[That bot's Grok Bot webhook routine]
     H --> I[Bot wakes, reads only the latest messages]
     I --> J[Reports the PR, answers the question, or escalates to you]
 ```
 
 ## Quickstart
 
-You need macOS or Linux with `jq`, `git` and `curl` on the machine where T3 Code runs.
+You need macOS or Linux with `bash`, `jq`, `git`, `perl`, `shasum` and `curl` on the machine where T3 Code runs.
 
 1. **Connect T3 Code to Grok Bot.** Turn on T3 Connect remote access in T3 Code, then add T3's remote MCP as a connector in Grok Bot and authorize it with OAuth. Details: [docs/t3-mcp-setup.md](docs/t3-mcp-setup.md).
 
@@ -80,13 +80,67 @@ templates/routine-prompt.md   prompt for the "T3 callback" routine
 templates/brief-footer.md     text to append to every brief sent to T3
 ```
 
+## Actionable status and stall checks
+
+The first word of `.grokbot-status` controls delivery:
+
+| Word | Action |
+| --- | --- |
+| `waiting <what>` | Skip. The thread must have its own timer or webhook. |
+| `idle` | Send. |
+| `needs_input`, `failed` | Always send, even when repeated. |
+| `milestone <what>`, `done ...` | Send. |
+| Any other word | Send for compatibility. This includes `continuing`, `turn_ended_no_status`, and `worktree_missing`. |
+
+Except for `needs_input` and `failed`, a status identical to the last successful
+send is skipped. The comparison uses the payload status (up to 2000 bytes),
+including trailing newlines. State is stored per worktree in
+`~/.grokbot-hooks/state/`. Only an HTTP 2xx response updates the sent status and
+clock. Failed requests can be sent again on a later invocation. Skips are logged
+as `skip=waiting` or `skip=duplicate` in `notify.log`.
+
+A waiting worktree gets a `stale waiting ...` notification after 7200 seconds
+since its last successful ping. If it has never sent a ping, the first observed
+waiting status starts the clock. A successful stale ping resets the clock; it
+can recur after another interval. Stale reminders bypass dedupe.
+
+Every hook invocation starts a background sweep of known waiting worktrees and
+missing markers. The current worktree is handled once. `notify.sh --sweep`
+runs the same check in the foreground without reading stdin, so launchd waits
+for completion. Stop-hook checks remain detached. A sweep reads the current marker
+and status files. It does not replay completed work. No check can run while the
+machine is off.
+
+For checks when there are no Stop events, an optional launchd example runs every
+15 minutes. It is not installed automatically. From this checkout, run these
+commands only when you choose to deploy:
+
+```bash
+cp "$HOME/.grokbot-hooks/notify.sh" "$HOME/.grokbot-hooks/notify.sh.backup-$(date +%Y%m%d-%H%M%S)"
+cp hooks/notify.sh "$HOME/.grokbot-hooks/notify.sh"
+chmod 700 "$HOME/.grokbot-hooks/notify.sh"
+# Optional periodic sweep:
+mkdir -p "$HOME/Library/LaunchAgents"
+sed "s|/Users/REPLACE_ME|$HOME|g" examples/com.grokbot.notify-sweep.plist > "$HOME/Library/LaunchAgents/com.grokbot.notify-sweep.plist"
+launchctl load "$HOME/Library/LaunchAgents/com.grokbot.notify-sweep.plist"
+```
+
+The plist sets PATH for Homebrew tools. Check its absolute script path before
+loading it. To change the interval, edit `StartInterval` (seconds).
+`GROKBOT_STALE_SECONDS` sets the stale threshold (default `7200`).
+`GROKBOT_HOOKS_DIR` overrides the hooks directory; `GROKBOT_STATE_DIR` overrides
+only the state directory. Set these in the launchd environment too if needed.
+
+Run `bash tests/notify-test.sh` for isolated tests with a stub curl. The tests
+use temporary HOME, hooks, and state directories and make no real HTTP requests.
+
 ## Design decisions
 
 **Harness-agnostic.** There is one script. Each harness gets one config line that calls it with its own name (`notify.sh codex`, `notify.sh claude`). Adding another harness that has a turn-end hook means adding one more line, not another script.
 
 **Opt-in per worktree.** The script does nothing unless the worktree root contains a `.grokbot` file. Bots write that file as the first step of a brief. Your own Codex or Claude Code sessions never have it, so they never trigger anything. The marker is excluded through the repo's `info/exclude`, so it never shows up in `git status` or gets committed.
 
-**The agent writes its status to a file.** Before ending each turn the agent overwrites `.grokbot-status` with `done`, `needs_input` or `failed` on the first line and a short note below. The script reads that file. It does not parse harness transcripts, which differ between harnesses and change between versions.
+**The agent writes its status to a file.** Before ending each turn the agent overwrites `.grokbot-status` with a status word and a short note. The script reads that file. It does not parse harness transcripts, which differ between harnesses and change between versions.
 
 **It survives a removed or switched worktree.** Every run that finds a marker records the worktree and bot in `~/.grokbot-hooks/markers.tsv`. If a later turn ends in a known worktree whose marker is gone, the bot is still notified, with the status `worktree_missing`. Runs with no marker and no record are always logged as `no-marker <path>`, so a missed callback shows up in the log instead of failing silently.
 
