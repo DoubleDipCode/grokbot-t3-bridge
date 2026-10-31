@@ -1,0 +1,12 @@
+# Never commit webhook secrets or local logs
+*.env
+.env*
+notify.log
+debug
+*.bak-grokbot-*
+
+# Bot marker files, in case this repo itself is worked on by a bot
+.grokbot
+.grokbot-status
+
+.DS_Store
