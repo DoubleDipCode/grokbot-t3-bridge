@@ -24,6 +24,9 @@ process() {
 ROOT="$1"
 HARNESS="$2"
 LAST="$3"
+SESSION="${4:-}"
+TRANSCRIPT="${5:-}"
+SESSION_CWD="${6:-}"
 TS="$(date '+%Y-%m-%dT%H:%M:%S%z')"
 NOW="$(date +%s)"
 if [ -f "$ROOT/.grokbot" ]; then
@@ -85,7 +88,8 @@ GROKBOT_WEBHOOK_AUTH=
 [ -n "$GROKBOT_WEBHOOK_URL" ] || return 0
 BODY="$("$JQ" -n --arg bot "$BOT" --arg harness "$HARNESS" --arg worktree "$ROOT" \
   --arg branch "$BRANCH" --arg status "$STATUS" --arg last "$LAST" --arg ts "$TS" \
-  '{event:"t3_turn_ended",bot:$bot,harness:$harness,worktree:$worktree,branch:$branch,status:$status,last_message:$last,ended_at:$ts}')" || return 0
+  --arg session "$SESSION" --arg transcript "$TRANSCRIPT" --arg cwd "$SESSION_CWD" \
+  '{event:"t3_turn_ended",bot:$bot,harness:$harness,worktree:$worktree,branch:$branch,status:$status,last_message:$last,ended_at:$ts,cwd:$cwd,session_id:$session,transcript_path:$transcript}')" || return 0
 # Never log curl diagnostics: they can contain a secret URL.
 HTTP="$(curl -sS -m 10 -X POST "$GROKBOT_WEBHOOK_URL" -H 'Content-Type: application/json' \
   ${GROKBOT_WEBHOOK_AUTH:+-H "Authorization: $GROKBOT_WEBHOOK_AUTH"} \
@@ -111,7 +115,7 @@ sweep() {
 }
 
 worker() {
-  [ -z "$CURRENT" ] || process "$CURRENT" "$HARNESS" "$MESSAGE"
+  [ -z "$CURRENT" ] || process "$CURRENT" "$HARNESS" "$MESSAGE" "$SESSION_ID" "$TRANSCRIPT_PATH" "$CWD"
   [ ! -f "$MAP" ] || sweep
   echo "$(date '+%Y-%m-%dT%H:%M:%S%z') worker-complete" >> "$LOG"
 }
@@ -121,6 +125,9 @@ if [ "$HARNESS" = --worker ]; then
   HARNESS="$2"
   CURRENT="$3"
   MESSAGE="$4"
+  SESSION_ID="${5:-}"
+  TRANSCRIPT_PATH="${6:-}"
+  CWD="${7:-}"
   worker
   exit 0
 fi
@@ -135,15 +142,20 @@ locked_worker() {
     flock($lock, LOCK_EX) or exit 0;
     exec @ARGV;
     exit 0;
-  ' "$STATE/lock" /bin/bash "$0" --worker "$HARNESS" "$CURRENT" "$MESSAGE"
+  ' "$STATE/lock" /bin/bash "$0" --worker "$HARNESS" "$CURRENT" "$MESSAGE" "$SESSION_ID" "$TRANSCRIPT_PATH" "$CWD"
 }
 
 CURRENT=
+SESSION_ID=
+TRANSCRIPT_PATH=
+CWD=
 MESSAGE=
 if [ "$HARNESS" != --sweep ]; then
   INPUT="$(cat 2>/dev/null)"
   CWD="$(printf '%s' "$INPUT" | "$JQ" -r '.cwd // empty' 2>/dev/null)"
   [ -n "$CWD" ] || CWD="$PWD"
+  SESSION_ID="$(printf '%s' "$INPUT" | "$JQ" -r '.session_id | strings' 2>/dev/null)"
+  TRANSCRIPT_PATH="$(printf '%s' "$INPUT" | "$JQ" -r '.transcript_path | strings' 2>/dev/null)"
   CURRENT="$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null || echo "$CWD")"
   MESSAGE="$(printf '%s' "$INPUT" | "$JQ" -r '.last_assistant_message // empty' 2>/dev/null | head -c 1500)"
 fi

@@ -10,6 +10,11 @@ You could put "when you finish, curl this URL" in the brief instead. That has th
 
 A `Stop` hook is run by the harness at the end of every turn, whether the agent remembers or not. The secret stays in a file on the machine. The agent's only job is to write a one-line status to a file, and if it skips that, the payload says `turn_ended_no_status` and the bot reads the thread.
 
+See [Claude Code](claude-code.md) or [Codex CLI](codex-cli.md) for standalone use.
+Registration and stdin fields were checked on 2026-11-01 against the
+[Claude hooks reference](https://code.claude.com/docs/en/hooks) and
+[Codex hooks reference](https://developers.openai.com/codex/hooks).
+
 ## Codex
 
 Codex reads hooks from `~/.codex/hooks.json`. `install.sh` adds this entry (with `$HOME` expanded to an absolute path):
@@ -62,7 +67,8 @@ Claude Code reads hooks from `~/.claude/settings.json`. `install.sh` adds:
 }
 ```
 
-There is no trust step. `last_message` may be empty for Claude Code.
+Review the command in `/hooks`. Claude also provides `last_assistant_message`;
+older versions may omit it. This setup does not register StopFailure or interrupt hooks.
 
 ## What the script does
 
@@ -100,6 +106,9 @@ Both were silent, because a no-marker run was only logged in debug mode. Now the
   "bot": "codexbot",
   "harness": "codex",
   "worktree": "/path/to/the/worktree",
+  "cwd": "/path/to/the/worktree/src",
+  "session_id": "example-session-id",
+  "transcript_path": "/path/to/local/transcript.jsonl",
   "branch": "feat/some-branch",
   "status": "done\nOpened PR, tests pass.",
   "last_message": "Last assistant message, up to 1500 bytes. Empty if the harness does not provide it.",
@@ -109,14 +118,22 @@ Both were silent, because a no-marker run was only logged in debug mode. Now the
 
 | Field | Meaning |
 | --- | --- |
-| `event` | Always `t3_turn_ended`. |
+| `event` | Always `t3_turn_ended`, including plain CLI callbacks, for compatibility. |
 | `bot` | Bot name from the `.grokbot` marker. |
 | `harness` | The argument the hook was called with: `codex`, `claude`, or `unknown`. |
 | `worktree` | Absolute path of the worktree root. |
+| `cwd` | Original hook working directory, with `$PWD` fallback. Not normalized to the git root. Empty for sweeps. |
+| `session_id` | Harness session ID from stdin, not a T3 thread ID. Empty if missing or not a string. |
+| `transcript_path` | Local transcript path from stdin; empty if missing, null, or not a string. Contents are never sent. |
 | `branch` | Current branch of the worktree. |
 | `status` | See the status table below. |
-| `last_message` | Codex: `last_assistant_message` from the hook input. May be empty for other harnesses. |
+| `last_message` | `last_assistant_message` from either harness; empty if absent. |
 | `ended_at` | Local time the hook ran, with UTC offset. |
+
+Sweep callbacks keep `harness: "sweep"` and leave the three new fields empty.
+No session identity is cached or inferred from another worktree. The bot must
+use its task record to resolve a sweep. Status dedupe remains per worktree and
+compares status only; new metadata does not force delivery.
 
 ### Status values
 
