@@ -1,12 +1,32 @@
 # grokbot-t3-bridge
 
-Connect Grok Bot agents to [T3 Code](https://t3.codes) ([source](https://github.com/pingdotgg/t3code)) and get woken up when a coding thread finishes, instead of polling it.
+Connect Grok Bot agents to plain Claude Code, plain Codex CLI, or [T3 Code](https://t3.codes) ([source](https://github.com/pingdotgg/t3code)) and get woken up when a coding thread finishes, instead of polling it.
 
 T3 Code is a desktop app that runs coding agents such as Codex and Claude Code in threads, each in its own git worktree. Grok Bot can drive it through T3's remote MCP connector: list projects, launch a thread with a brief, read it, reply to it. This repo covers that setup, plus a small hook that tells the right bot when a coding turn ends.
 
+## Choose your harness
+
+Which harness do you use? Follow one path:
+
+- **[T3 Code](docs/t3.md):** start, track, read, and nudge threads through T3 MCP.
+- **[Plain Claude Code](docs/claude-code.md):** start with `claude` or `claude -p`;
+  track the session ID and transcript path; continue with `claude -p --resume`.
+- **[Plain Codex CLI](docs/codex-cli.md):** start with `codex` or `codex exec`;
+  track the session ID; continue with `codex exec resume`.
+
+All paths use the same `notify.sh`, marker, status words, and webhook setup.
+For plain CLI use, the bot needs shell access to the agent machine to read local
+history or resume a stopped session. Without it, the bot can only notify you.
+This bridge cannot steer a live interactive CLI or approve tools. Read each
+file before installation. The one-shot prompt asks which path to build and
+requires your approval of the files before it installs them.
+
+The quickstart and T3 workflow below are for **T3 Code**. Plain CLI users should
+follow their linked guide and [shared CLI setup](docs/cli-setup.md).
+
 ## Don't want to run our scripts? Have your bot build it
 
-You don't have to trust the code in this repo. [ONE-SHOT-PROMPT.md](ONE-SHOT-PROMPT.md) is a single prompt you can paste into your own Grok Bot, or any agent with shell access to your T3 machine. It describes the whole setup as a spec, so your agent writes its own version, shows you every file before installing, and leaves the secrets for you to enter yourself.
+You don't have to trust the code in this repo. [ONE-SHOT-PROMPT.md](ONE-SHOT-PROMPT.md) is a single prompt you can paste into your own Grok Bot, or any agent with shell access to your agent machine. It describes the whole setup as a spec, so your agent writes its own version, shows you every file before installing, and leaves the secrets for you to enter yourself.
 
 ## The problem
 
@@ -30,7 +50,7 @@ flowchart TD
     I --> J[Reports the PR, answers the question, or escalates to you]
 ```
 
-## Quickstart
+## T3 Code quickstart
 
 You need macOS or Linux with `bash`, `jq`, `git`, `perl`, `shasum` and `curl` on the machine where T3 Code runs.
 
@@ -75,6 +95,11 @@ hooks/notify.sh           the Stop hook: reads marker + status, POSTs to the bot
 hooks/set-webhook.sh      stores one bot's webhook URL + auth in a chmod 600 file
 docs/t3-mcp-setup.md      connecting T3 Code's MCP to Grok Bot, and the tools bots use
 docs/hooks.md             hook config per harness, payload schema, debugging
+docs/t3.md                T3 path and existing workflow links
+docs/claude-code.md       plain Claude Code setup and resume
+docs/codex-cli.md         plain Codex CLI setup and resume
+docs/cli-setup.md         shared setup and limits for plain CLI sessions
+templates/cli-*.md        plain CLI task footer and callback routine
 docs/grokbot-side.md      webhook routine, brief additions, backup check, cleanup
 templates/routine-prompt.md   prompt for the "T3 callback" routine
 templates/brief-footer.md     text to append to every brief sent to T3
@@ -131,6 +156,7 @@ loading it. To change the interval, edit `StartInterval` (seconds).
 `GROKBOT_HOOKS_DIR` overrides the hooks directory; `GROKBOT_STATE_DIR` overrides
 only the state directory. Set these in the launchd environment too if needed.
 
+Run `python3 tests/notify-http-test.py` for local HTTP payload tests for all three paths.
 Run `bash tests/notify-test.sh` for isolated tests with a stub curl. The tests
 use temporary HOME, hooks, and state directories and make no real HTTP requests.
 
@@ -159,7 +185,9 @@ use temporary HOME, hooks, and state directories and make no real HTTP requests.
 ## Limits
 
 - The hook only tells you that a turn ended. Everything else comes from reading the thread through the MCP.
-- `last_message` is filled for Codex, which passes `last_assistant_message` to the hook. Other harnesses may leave it empty.
+- `last_message` uses `last_assistant_message` when supplied by either harness.
+- `session_id`, `transcript_path`, and `cwd` come from Stop input. They are empty
+  for sweeps; see [the payload schema](docs/hooks.md#payload).
 - `worktree_missing` only works for worktrees the hook has seen with a marker at least once. A worktree removed before its first turn ended is reported as `no-marker`, and only the backup check finds it.
 - `notify.log` now gets a `no-marker` line for every turn of your own sessions too. It is rotated once at about 1 MB (`notify.log.1`), so it stays small.
 - The script sends the callback in the background and does not retry. If the POST fails, `notify.log` shows `http=000` or the error code, and the backup check catches the thread later.
