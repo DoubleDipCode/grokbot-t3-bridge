@@ -1,11 +1,13 @@
 #!/bin/bash
 # shellcheck disable=SC2016 # Single-quoted expressions are jq programs.
-# Actionable Stop notifications; --sweep checks saved waiting worktrees.
+# Actionable Stop notifications; --sweep checks saved worktrees for stalls.
 HARNESS="${1:-unknown}"
 DIR="${GROKBOT_HOOKS_DIR:-$HOME/.grokbot-hooks}"
 STATE="${GROKBOT_STATE_DIR:-$DIR/state}"
 STALE="${GROKBOT_STALE_SECONDS:-7200}"
 case "$STALE" in *[!0-9]*|'') STALE=7200 ;; esac
+STALL_MINUTES="${GROKBOT_STALL_MINUTES:-45}"
+case "$STALL_MINUTES" in *[!0-9]*|'') STALL_MINUTES=45 ;; esac
 LOG="$DIR/notify.log"
 MAP="$DIR/markers.tsv"   # worktree<TAB>bot, so a removed or switched worktree can still be reported
 [ -d "$DIR" ] || exit 0  # not installed
@@ -19,6 +21,26 @@ JQ="$(command -v jq 2>/dev/null || echo /usr/bin/jq)"
 if [ -f "$LOG" ] && [ "$(wc -c < "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; then
   mv -f "$LOG" "$LOG.1" 2>/dev/null
 fi
+
+# A live harness is conservative evidence of an active turn, including tool/CI
+# waits. Match executable names in argv, not arbitrary mentions of "codex".
+# lsof is restricted to candidate PIDs and cwd, so no recursive file scan.
+harness_running() {
+  local pids result cwd root
+  root="$(cd "$1" 2>/dev/null && pwd -P)" || return 0
+  pids="$(pgrep -f '(^|/|[[:space:]])(codex|claude|claude-code|agent-harness)([[:space:]]|$)' 2>/dev/null)"
+  result=$?
+  [ "$result" -eq 1 ] && return 1
+  [ "$result" -eq 0 ] || return 0
+  pids="$(printf '%s' "$pids" | paste -sd, -)"
+  cwd="$(lsof -a -p "$pids" -d cwd -Fn 2>/dev/null)" || return 0
+  while IFS= read -r line; do
+    case "$line" in
+      "n$root"|"n$root/"*) return 0 ;;
+    esac
+  done <<< "$cwd"
+  return 1
+}
 
 process() {
 ROOT="$1"
@@ -62,7 +84,19 @@ CACHE="$STATE/$KEY.json"
 WORD="$(printf '%s' "$STATUS" | awk 'NR==1 {print $1}')"
 CLOCK="$("$JQ" -r '.clock // empty' "$CACHE" 2>/dev/null)"
 case "$CLOCK" in *[!0-9]*|'') CLOCK="$NOW" ;; esac
+# Track file changes separately from delivery state. Include high-resolution mtime
+# and inode so rewriting the same line also starts a new stall period.
+REVISION="$(perl -MTime::HiRes=stat -e '
+  my @s = stat($ARGV[0]); print @s ? join(":", @s[1,7,9]) : "missing";
+' "$ROOT/.grokbot-status")"
+OBSERVED="$STATE/$KEY.observed"
+if ! "$JQ" -e --arg revision "$REVISION" --arg status "$STATUS"   '.revision == $revision and .status == $status' "$OBSERVED" >/dev/null 2>&1; then
+  "$JQ" -n --arg revision "$REVISION" --arg status "$STATUS"     '{revision:$revision,status:$status}' > "$OBSERVED.tmp" &&
+    mv -f "$OBSERVED.tmp" "$OBSERVED"
+  rm -f "$STATE/$KEY.stalled" "$STATE/$KEY.waiting"
+fi
 if [ "$WORD" = waiting ]; then
+  [ ! -f "$STATE/$KEY.waiting" ] || return 0
   if [ ! -f "$CACHE" ]; then
     "$JQ" -n --argjson clock "$NOW" '{clock:$clock}' > "$CACHE"
   fi
@@ -71,6 +105,17 @@ if [ "$WORD" = waiting ]; then
     return 0
   fi
   STATUS="stale $STATUS"
+elif [ "$HARNESS" = sweep ] && [ -f "$ROOT/.grokbot" ]; then
+  [ "$WORD" != "done" ] || return 0
+  [ ! -f "$STATE/$KEY.stalled" ] || return 0
+  MODIFIED="$(perl -e 'print((stat($ARGV[0]))[9] || (stat($ARGV[1]))[9] || time)'     "$ROOT/.grokbot-status" "$ROOT/.grokbot")"
+  # No previous ping means the file timestamp alone determines age.
+  if [ ! -f "$CACHE" ]; then CLOCK="$MODIFIED"; fi
+  [ "$MODIFIED" -le "$CLOCK" ] || CLOCK="$MODIFIED"
+  AGE=$((NOW - CLOCK))
+  [ "$AGE" -ge "$((STALL_MINUTES * 60))" ] || return 0
+  harness_running "$ROOT" && return 0
+  STATUS="stalled $((AGE / 60))m $STATUS"
 elif [ "$WORD" != needs_input ] && [ "$WORD" != failed ] &&
   "$JQ" -e --arg status "$STATUS" '.status == $status' "$CACHE" >/dev/null 2>&1; then
   echo "$TS $HARNESS skip=duplicate $ROOT" >> "$LOG"
@@ -90,6 +135,11 @@ BODY="$("$JQ" -n --arg bot "$BOT" --arg harness "$HARNESS" --arg worktree "$ROOT
   --arg branch "$BRANCH" --arg status "$STATUS" --arg last "$LAST" --arg ts "$TS" \
   --arg session "$SESSION" --arg transcript "$TRANSCRIPT" --arg cwd "$SESSION_CWD" \
   '{event:"t3_turn_ended",bot:$bot,harness:$harness,worktree:$worktree,branch:$branch,status:$status,last_message:$last,ended_at:$ts,cwd:$cwd,session_id:$session,transcript_path:$transcript}')" || return 0
+# Record stall attempts only once a payload and webhook are available.
+# At most one request per revision, even on HTTP failure or worker crash.
+if [ "$HARNESS" = sweep ] && [[ "$STATUS" = stalled\ * ]]; then
+  touch "$STATE/$KEY.stalled" || return 0
+fi
 # Never log curl diagnostics: they can contain a secret URL.
 HTTP="$(curl -sS -m 10 -X POST "$GROKBOT_WEBHOOK_URL" -H 'Content-Type: application/json' \
   ${GROKBOT_WEBHOOK_AUTH:+-H "Authorization: $GROKBOT_WEBHOOK_AUTH"} \
@@ -97,20 +147,18 @@ HTTP="$(curl -sS -m 10 -X POST "$GROKBOT_WEBHOOK_URL" -H 'Content-Type: applicat
 RESULT=$?
 echo "$TS $BOT webhook http=$HTTP result=$RESULT" >> "$LOG"
 if [ "$RESULT" -eq 0 ] && [[ "$HTTP" = 2?? ]]; then
+  [ "$WORD" != waiting ] || touch "$STATE/$KEY.waiting"
   "$JQ" -n --arg status "$STATUS" --argjson clock "$(date +%s)" \
     '{status:$status,clock:$clock}' > "$CACHE.tmp" && mv -f "$CACHE.tmp" "$CACHE"
 fi
 }
 
 sweep() {
-  # Only waiting and missing markers need periodic attention. Do not replay done.
+  # Check all known worktrees; process preserves missing-marker delivery.
   while IFS=$'\t' read -r path bot; do
     [ -n "$path" ] && [ -n "$bot" ] || continue
     [ "$path" = "$CURRENT" ] && continue
-    if [ ! -f "$path/.grokbot" ] ||
-      [ "$(awk 'NR==1 {print $1; exit}' "$path/.grokbot-status" 2>/dev/null)" = waiting ]; then
-      process "$path" sweep ""
-    fi
+    process "$path" sweep ""
   done < "$MAP"
 }
 

@@ -87,8 +87,9 @@ Resolve them through the bot's task record; if there is no unique match, notify
 the human. Never resume from a sweep alone.
 
 The optional [launchd sweep](../README.md#actionable-status-and-stall-checks)
-checks waiting worktrees and missing markers. It does not check running processes
-or start sessions. Crashes, interrupts, API errors, sleeping machines, and failed
+checks all known worktrees for stalls after 45 minutes (configurable with
+`GROKBOT_STALL_MINUTES`), waiting reminders, and missing markers. It checks harness processes
+but does not start sessions. Crashes, interrupts, API errors, sleeping machines, and failed
 HTTP delivery can produce no callback. Keep a separate, infrequent check of known
 tasks, or ask the human to check them. No automatic retry or remote access is
 provided here.

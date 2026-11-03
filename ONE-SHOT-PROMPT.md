@@ -68,9 +68,9 @@ brief, a prompt, a log or a command line. I will enter them myself in a terminal
      needs_input and failed. Preserve trailing newlines within the 2000-byte cap.
      Log skips with a reason. Failed sends must not advance this cache.
    - For waiting, send "stale <status>" after 7200 seconds since the last successful
-     ping, or since first observed waiting if no ping exists. Reset the clock after
-     successful delivery. Stale reminders bypass dedupe and may recur each interval.
-   - Sweep known waiting worktrees and missing markers in the background on every
+     ping, or since first observed waiting if no ping exists. Send only one stale waiting reminder per unchanged status. Reset the clock after
+     successful delivery. Stale reminders bypass Stop-hook dedupe.
+   - Sweep all known worktrees and missing markers in the background on every
      hook invocation. Also support notify.sh --sweep in the foreground without reading stdin
      so launchd waits for completion. Use kernel-managed locks (Perl flock is
      available on macOS); do not reclaim PID locks with racy deletion.
@@ -203,3 +203,11 @@ brief, a prompt, a log or a command line. I will enter them myself in a terminal
 When you are done, give me a short summary of what you installed, where, and how to
 remove it.
 ```
+
+
+The sweep must send `stalled <minutes>m <original status>` once per status
+revision after `GROKBOT_STALL_MINUTES` (default 45), excluding done and waiting.
+Use the newer of status mtime and last successful ping. Check harness cwd with
+pgrep/lsof and suppress alerts while a harness is present, including CI waits.
+Record the attempt beside dedupe state before POST. Do not retry until status
+changes. Keep Stop-hook urgent sends and missing-marker reports unchanged.
