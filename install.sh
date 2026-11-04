@@ -1,6 +1,6 @@
 #!/bin/bash
-# Install the Grok Bot turn-end hook for Codex and Claude Code.
-# Safe to run more than once: it only adds the Stop entry if it is not already there,
+# Install the Grok Bot turn-end and approval-prompt hooks for Codex and Claude Code.
+# Safe to run more than once: it only adds an entry if the event does not already run notify.sh,
 # and backs up a config file (<file>.bak-grokbot-<timestamp>) only when it is about to change it.
 set -euo pipefail
 
@@ -25,23 +25,31 @@ backup() {
   return 0
 }
 
-# add_stop_hook <file> <entry-json>
-# Appends {"hooks":[entry]} to .hooks.Stop unless a Stop hook already runs grokbot-hooks/notify.sh.
-add_stop_hook() {
-  local file="$1" entry="$2" tmp
-  if jq -e '[.hooks.Stop[]?.hooks[]?.command // empty | select(contains("grokbot-hooks/notify.sh"))] | length > 0' "$file" >/dev/null; then
-    echo "  Stop hook already present in $file, leaving it alone"
+# add_hook <file> <event> <entry-json>
+# Appends {"hooks":[entry]} to .hooks.<event> unless a hook for that event already runs
+# grokbot-hooks/notify.sh. Merges into the existing JSON: every other key is kept as is.
+# Nothing from the file is printed, since Claude settings can hold secrets.
+add_hook() {
+  local file="$1" event="$2" entry="$3" tmp
+  if ! jq -e . "$file" >/dev/null 2>&1; then
+    echo "  warning: $file is not valid JSON, skipping it (fix it and run install.sh again)" >&2
+    return
+  fi
+  if jq -e --arg ev "$event" '[.hooks[$ev][]?.hooks[]?.command // empty | select(contains("grokbot-hooks/notify.sh"))] | length > 0' "$file" >/dev/null; then
+    echo "  $event hook already present in $file, leaving it alone"
     return
   fi
   backup "$file"
   tmp="$(mktemp)"
-  jq --argjson entry "$entry" '.hooks = (.hooks // {}) | .hooks.Stop = ((.hooks.Stop // []) + [{hooks: [$entry]}])' "$file" > "$tmp"
+  jq --arg ev "$event" --argjson entry "$entry" \
+    '.hooks = (.hooks // {}) | .hooks[$ev] = ((.hooks[$ev] // []) + [{hooks: [$entry]}])' "$file" > "$tmp"
   cat "$tmp" > "$file"   # keep the original file's permissions
   rm -f "$tmp"
-  echo "  Added Stop hook to $file"
+  echo "  Added $event hook to $file"
 }
 
 # 2. Codex: ~/.codex/hooks.json (created if missing).
+#    Stop pings at turn end; PermissionRequest pings when Codex is about to ask for approval.
 CODEX_HOOKS="$HOME/.codex/hooks.json"
 echo "Codex:"
 mkdir -p "$HOME/.codex"
@@ -49,28 +57,45 @@ if [ ! -f "$CODEX_HOOKS" ]; then
   echo '{"hooks":{}}' > "$CODEX_HOOKS"
   echo "  Created $CODEX_HOOKS"
 fi
-add_stop_hook "$CODEX_HOOKS" "$(jq -n --arg cmd "$NOTIFY codex" \
+add_hook "$CODEX_HOOKS" Stop "$(jq -n --arg cmd "$NOTIFY codex" \
+  '{type:"command",command:$cmd,timeout:15,statusMessage:"Notifying Grok Bot"}')"
+add_hook "$CODEX_HOOKS" PermissionRequest "$(jq -n --arg cmd "$NOTIFY codex-permission" \
   '{type:"command",command:$cmd,timeout:15,statusMessage:"Notifying Grok Bot"}')"
 
-# 3. Claude Code: ~/.claude/settings.json (only if Claude Code is set up on this machine).
-CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+# 3. Claude Code: every config dir that exists. T3's Claude Personal and Work (VMG) providers
+#    set CLAUDE_CONFIG_DIR to ~/.claude-personal and ~/.claude-vmg, so ~/.claude alone is not enough.
+#    GROKBOT_CLAUDE_DIRS (space separated) replaces the default list; CLAUDE_CONFIG_DIR is added.
 echo "Claude Code:"
-if [ -d "$HOME/.claude" ]; then
-  if [ ! -f "$CLAUDE_SETTINGS" ]; then
-    echo '{}' > "$CLAUDE_SETTINGS"
-    echo "  Created $CLAUDE_SETTINGS"
+CLAUDE_DIRS="${GROKBOT_CLAUDE_DIRS:-$HOME/.claude $HOME/.claude-personal $HOME/.claude-vmg}"
+[ -z "${CLAUDE_CONFIG_DIR:-}" ] || CLAUDE_DIRS="$CLAUDE_DIRS $CLAUDE_CONFIG_DIR"
+SEEN=" "
+FOUND=0
+for dir in $CLAUDE_DIRS; do
+  dir="${dir%/}"
+  case "$SEEN" in *" $dir "*) continue ;; esac
+  SEEN="$SEEN$dir "
+  if [ ! -d "$dir" ]; then
+    echo "  $dir not found, skipping"
+    continue
   fi
-  add_stop_hook "$CLAUDE_SETTINGS" "$(jq -n --arg cmd "$NOTIFY claude" \
+  FOUND=1
+  settings="$dir/settings.json"
+  if [ ! -f "$settings" ]; then
+    echo '{}' > "$settings"
+    echo "  Created $settings"
+  fi
+  add_hook "$settings" Stop "$(jq -n --arg cmd "$NOTIFY claude" \
     '{type:"command",command:$cmd,timeout:15}')"
-else
-  echo "  ~/.claude not found, skipping (run install.sh again after installing Claude Code)"
-fi
+  add_hook "$settings" Notification "$(jq -n --arg cmd "$NOTIFY claude-notify" \
+    '{type:"command",command:$cmd,timeout:15}')"
+done
+[ "$FOUND" = 1 ] || echo "  no Claude config dir found (run install.sh again after installing Claude Code)"
 
 cat <<NEXT
 
 Next steps:
   1. Codex only runs hooks you have trusted. Run: codex
-     then type /hooks and trust the "Notifying Grok Bot" Stop hook.
+     then type /hooks and trust the "Notifying Grok Bot" Stop and PermissionRequest hooks.
      Sessions that were already running keep their old hooks, so test in a new thread.
   2. For each bot, create a "T3 callback" webhook routine in Grok Bot, then run:
        $DEST/set-webhook.sh <bot-name>

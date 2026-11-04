@@ -43,6 +43,8 @@ Two things to know:
 1. **Codex only runs hooks you have trusted.** After installing, or after any change to the hook, run `codex`, type `/hooks`, and trust it.
 2. **Running sessions keep the hook set they started with.** Threads that were already open will not pick up the new hook. Start a fresh thread to test.
 
+`install.sh` also adds `PermissionRequest` with `notify.sh codex-permission`; trust it in `/hooks` too. See [Approval-prompt pings](#approval-prompt-pings).
+
 Codex passes `last_assistant_message` on stdin, so the payload includes the agent's last message.
 
 ## Claude Code
@@ -67,8 +69,43 @@ Claude Code reads hooks from `~/.claude/settings.json`. `install.sh` adds:
 }
 ```
 
+`install.sh` also adds the `Notification` event (command `notify.sh claude-notify`) and writes both entries to every Claude config dir that exists: `~/.claude`, `~/.claude-personal` and `~/.claude-vmg` (T3's Claude Personal and Work (VMG) providers use the last two as `CLAUDE_CONFIG_DIR`), plus `$CLAUDE_CONFIG_DIR` when set. Existing keys such as `env` are merged, never dropped or printed. See [Approval-prompt pings](#approval-prompt-pings).
+
 Review the command in `/hooks`. Claude also provides `last_assistant_message`;
 older versions may omit it. This setup does not register StopFailure or interrupt hooks.
+
+## Approval-prompt pings
+
+A thread blocked on a permission prompt has not ended its turn, so Stop never fires and the sweep used to see it as busy. Two extra events ping while the prompt is open:
+
+| Harness | Event | Command | Fires |
+| --- | --- | --- | --- |
+| Claude Code | `Notification` | `notify.sh claude-notify` | About 6 seconds after a permission prompt appears (`notification_type: permission_prompt`) |
+| Codex | `PermissionRequest` | `notify.sh codex-permission` | When Codex is about to ask for approval |
+
+Both send the usual payload with status `needs_input approval <summary>` (summary: one line, at most 200 bytes) and they:
+
+- **Always ping.** No dedupe, like `needs_input`. They never read or write `.grokbot-status` or the dedupe cache, so the thread's own status is unchanged.
+- **Find the marker** in the hook's `cwd` or any parent up to the git toplevel. If the marker is gone but the worktree is in `markers.tsv`, they still ping.
+- **Never block the harness.** Everything after reading stdin runs detached; curl has a 10-second timeout; nothing is printed and the exit code is 0. The Codex handler prints no decision, so Codex still shows its own prompt.
+- **Claude summary:** the command of the last `tool_use` in the transcript (`Bash: npm publish`) when it can be read, else the notification message (`Claude needs your permission to use Bash`). The transcript is only read for this one line and is never sent.
+- **Codex summary:** `tool_name: tool_input.description`, or the command when there is no description. Commands can contain secrets, so the summary is cut to 200 bytes and goes only to the bot's own webhook; log lines hold the first 80 bytes of status.
+
+Claude `notification_type` values that count as approval or input: `permission_prompt`, `elicitation_dialog`, `elicitation_url_dialog`, `agent_needs_input`. Everything else (`idle_prompt`, `auth_success`, `quota_*`, `agent_completed`, ...) is ignored; `idle_prompt` means the turn already ended, which the Stop ping covers. Claude versions that send no type are matched on a message containing "permission".
+
+**Codex `notify`:** Codex's `notify` setting supports only `agent-turn-complete`; `approval-requested` exists only for its built-in TUI notifications. Use the `PermissionRequest` hook instead. It may also fire for requests that Codex's auto-review then approves, so an occasional ping needs no action.
+
+Checked on 2026-11-04 against the [Claude hooks reference](https://code.claude.com/docs/en/hooks) and the [Codex hooks reference](https://developers.openai.com/codex/hooks); the installed codex-cli 0.166.0 binary knows the `PermissionRequest` event.
+
+### Stall fallback in the sweep
+
+Hooks can miss a prompt (older harness, hook not trusted, config dir not registered). `notify.sh --sweep`, and the background sweep every hook run starts, also sends one `stalled <N>m approval? <original status>` ping when all of these hold:
+
+1. The marked worktree's status word is not `done`, `failed`, `needs_input`, `idle` or `waiting`. Those were already pinged at turn end, `waiting` has its own stale timer, and an idle session left open is normal. So `milestone ...`, `continuing`, no status file, and other words qualify.
+2. A `claude` or `codex` process has that worktree (or a subdirectory) as its working directory (`ps` plus `lsof`; override the process-name regex with `GROKBOT_HARNESS_RE`).
+3. For `GROKBOT_STALL_MINUTES` (default `45`) none of these changed: any file in the worktree except `.git` and `node_modules` (so build output counts, which spares long builds), the git `index`, `HEAD` and `logs/HEAD`, the newest Claude session log in `~/.claude*/projects/<worktree path>/`, and the transcript path saved by the last Stop ping.
+
+`N` is the threshold, so read it as "at least N minutes". One ping per stall: the status file's mtime is recorded in the state cache, and any later activity clears it, so a second stall pings again. A long task that writes no files and no session log for 45 minutes (a silent test run, say) can still false-positive once. Raise `GROKBOT_STALL_MINUTES` for such projects. If `ps` or `lsof` is unavailable the check does nothing. A thread that sits at a prompt after a turn that wrote `done` is not detected by the sweep; only the hook covers that case.
 
 ## What the script does
 
@@ -120,7 +157,7 @@ Both were silent, because a no-marker run was only logged in debug mode. Now the
 | --- | --- |
 | `event` | Always `t3_turn_ended`, including plain CLI callbacks, for compatibility. |
 | `bot` | Bot name from the `.grokbot` marker. |
-| `harness` | The argument the hook was called with: `codex`, `claude`, or `unknown`. |
+| `harness` | The argument the hook was called with: `codex`, `claude`, `unknown`, `claude-notify`, `codex-permission`, or `sweep`. |
 | `worktree` | Absolute path of the worktree root. |
 | `cwd` | Original hook working directory, with `$PWD` fallback. Not normalized to the git root. Empty for sweeps. |
 | `session_id` | Harness session ID from stdin, not a T3 thread ID. Empty if missing or not a string. |
@@ -143,6 +180,8 @@ compares status only; new metadata does not force delivery.
 | `needs_input` | The agent needs a decision. The rest is the question and options. |
 | `failed` | The agent is stuck. The rest says what blocked it. |
 | `turn_ended_no_status` | The worktree has a marker but no `.grokbot-status`. Read the thread. |
+| `needs_input approval <summary>` | Mid-turn: the harness is blocked on an approval or input prompt. Sent by `claude-notify` / `codex-permission`, harness field is that mode name. A bot cannot answer it; tell the human. |
+| `stalled <N>m approval? <status>` | Sweep only (`harness: "sweep"`): a harness is running but nothing has changed for N minutes. `<status>` is the worktree's last status text. |
 | `worktree_missing` | The worktree is known from `markers.tsv` but has no marker now (removed, or the session's cwd is an old path). The full text is `worktree_missing worktree <path> no longer has a .grokbot marker (deleted or moved); read the thread for its real state`. `branch` is usually empty. Read the thread. |
 
 Request headers: `Content-Type: application/json` and, if set, `Authorization: <value from set-webhook.sh>`.

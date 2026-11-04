@@ -64,9 +64,9 @@ You need macOS or Linux with `bash`, `jq`, `git`, `perl`, `shasum` and `curl` on
    ./install.sh
    ```
 
-   This copies the scripts to `~/.grokbot-hooks` and adds a `Stop` entry to `~/.codex/hooks.json` and, if Claude Code is set up, `~/.claude/settings.json`. Running it again changes nothing.
+   This copies the scripts to `~/.grokbot-hooks`, then adds `Stop` and `PermissionRequest` entries to `~/.codex/hooks.json` and `Stop` and `Notification` entries to every Claude config dir that exists (`~/.claude`, `~/.claude-personal`, `~/.claude-vmg`, plus `$CLAUDE_CONFIG_DIR`). It merges into existing JSON without dropping other keys and prints none of their contents. Running it again changes nothing.
 
-3. **Trust the hook in Codex.** Run `codex`, type `/hooks`, and trust the "Notifying Grok Bot" hook. Claude Code has no trust step. See [docs/hooks.md](docs/hooks.md).
+3. **Trust the hook in Codex.** Run `codex`, type `/hooks`, and trust the "Notifying Grok Bot" hook. Trust the `PermissionRequest` one as well. Claude Code has no trust step. See [docs/hooks.md](docs/hooks.md).
 
 4. **Create a webhook routine per bot** in Grok Bot, named "T3 callback", using [templates/routine-prompt.md](templates/routine-prompt.md) as its prompt. Copy its URL and Authorization header from the routine panel. See [docs/grokbot-side.md](docs/grokbot-side.md).
 
@@ -89,9 +89,9 @@ To remove the hook entries later, run `./uninstall.sh`.
 ```
 README.md                 this file
 ONE-SHOT-PROMPT.md        paste-in prompt for building your own version from scratch
-install.sh                installs the hook for Codex and Claude Code (idempotent)
+install.sh                installs the hooks for Codex and every Claude config dir (idempotent)
 uninstall.sh              removes the hook entries again
-hooks/notify.sh           the Stop hook: reads marker + status, POSTs to the bot
+hooks/notify.sh           Stop hook, approval-prompt pings and sweep: reads marker + status, POSTs to the bot
 hooks/set-webhook.sh      stores one bot's webhook URL + auth in a chmod 600 file
 docs/t3-mcp-setup.md      connecting T3 Code's MCP to Grok Bot, and the tools bots use
 docs/hooks.md             hook config per harness, payload schema, debugging
@@ -115,6 +115,7 @@ The first word of `.grokbot-status` controls delivery:
 | `idle` | Send. |
 | `needs_input`, `failed` | Always send, even when repeated. |
 | `milestone <what>`, `done ...` | Send. |
+| `needs_input approval ...` | Not a status-file value: the approval hooks send it mid-turn. Always sent, no dedupe, status file untouched. |
 | Any other word | Send for compatibility. This includes `continuing`, `turn_ended_no_status`, and `worktree_missing`. |
 
 Except for `needs_input` and `failed`, a status identical to the last successful
@@ -153,10 +154,13 @@ launchctl load "$HOME/Library/LaunchAgents/com.grokbot.notify-sweep.plist"
 The plist sets PATH for Homebrew tools. Check its absolute script path before
 loading it. To change the interval, edit `StartInterval` (seconds).
 `GROKBOT_STALE_SECONDS` sets the stale threshold (default `7200`).
+`GROKBOT_STALL_MINUTES` sets the quiet time before a running harness is reported as
+stalled (default `45`; see [the stall fallback](docs/hooks.md#stall-fallback-in-the-sweep)).
 `GROKBOT_HOOKS_DIR` overrides the hooks directory; `GROKBOT_STATE_DIR` overrides
 only the state directory. Set these in the launchd environment too if needed.
 
 Run `python3 tests/notify-http-test.py` for local HTTP payload tests for all three paths.
+Run `bash tests/install-test.sh` for the installer and uninstaller against a temporary HOME.
 Run `bash tests/notify-test.sh` for isolated tests with a stub curl. The tests
 use temporary HOME, hooks, and state directories and make no real HTTP requests.
 
@@ -180,7 +184,7 @@ use temporary HOME, hooks, and state directories and make no real HTTP requests.
 
 **One thread per task, and threads don't delete their own worktree.** A harness session keeps the working directory it started in. If you reuse a thread for a new task in a new worktree, its turns still end in the old path, so the hook looks for the marker in the wrong place. And a thread that runs `git worktree remove` on its own worktree deletes the marker before its turn ends. The bot removes the worktree after the thread's final turn instead. See [docs/grokbot-side.md](docs/grokbot-side.md).
 
-**Use full-access threads for bot work.** A thread in approval-required mode that stops on a permission prompt has not ended its turn, so the hook does not fire and the bot cannot approve the prompt either. Bots should launch full-access threads in a worktree. If a thread must be approval-required, a human has to watch it in T3.
+**Use full-access threads for bot work.** A thread in approval-required mode that stops on a permission prompt has not ended its turn, so Stop does not fire, and the bot cannot approve the prompt. The `Notification` (Claude) and `PermissionRequest` (Codex) hooks ping the bot with `needs_input approval ...` while the prompt is open so a human hears about it, and the sweep sends `stalled <N>m approval? ...` as a fallback. Bots should still launch full-access threads in a worktree. See [approval-prompt pings](docs/hooks.md#approval-prompt-pings).
 
 ## Limits
 
