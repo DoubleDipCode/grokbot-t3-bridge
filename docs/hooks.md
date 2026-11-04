@@ -69,7 +69,7 @@ Claude Code reads hooks from `~/.claude/settings.json`. `install.sh` adds:
 }
 ```
 
-`install.sh` also adds the `Notification` event (command `notify.sh claude-notify`) and writes both entries to every Claude config dir that exists: `~/.claude`, `~/.claude-personal` and `~/.claude-vmg` (T3's Claude Personal and Work (VMG) providers use the last two as `CLAUDE_CONFIG_DIR`), plus `$CLAUDE_CONFIG_DIR` when set. Existing keys such as `env` are merged, never dropped or printed. See [Approval-prompt pings](#approval-prompt-pings).
+`install.sh` also adds the `Notification` event (command `notify.sh claude-notify`) and writes both entries to every Claude config dir it finds: `~/.claude`, `$CLAUDE_CONFIG_DIR` when set, and every other `~/.claude-*` directory that contains a `settings.json` (for example one per provider, each launched with its own `CLAUDE_CONFIG_DIR`). To name other dirs, or to replace the list, set `GROKBOT_EXTRA_CLAUDE_DIRS` or `GROKBOT_CLAUDE_DIRS` in the environment or in `~/.grokbot-hooks/config` (see the [README](../README.md#configuration)). Existing keys such as `env` are merged, never dropped or printed. See [Approval-prompt pings](#approval-prompt-pings).
 
 Review the command in `/hooks`. Claude also provides `last_assistant_message`;
 older versions may omit it. This setup does not register StopFailure or interrupt hooks.

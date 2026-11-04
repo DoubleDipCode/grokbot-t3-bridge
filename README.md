@@ -64,7 +64,7 @@ You need macOS or Linux with `bash`, `jq`, `git`, `perl`, `shasum` and `curl` on
    ./install.sh
    ```
 
-   This copies the scripts to `~/.grokbot-hooks`, then adds `Stop` and `PermissionRequest` entries to `~/.codex/hooks.json` and `Stop` and `Notification` entries to every Claude config dir that exists (`~/.claude`, `~/.claude-personal`, `~/.claude-vmg`, plus `$CLAUDE_CONFIG_DIR`). It merges into existing JSON without dropping other keys and prints none of their contents. Running it again changes nothing.
+   This copies the scripts to `~/.grokbot-hooks`, then adds `Stop` and `PermissionRequest` entries to `~/.codex/hooks.json` and `Stop` and `Notification` entries to every Claude config dir it finds: `~/.claude`, `$CLAUDE_CONFIG_DIR`, and every other `~/.claude-*` directory that contains a `settings.json` (for example one per provider, set with `CLAUDE_CONFIG_DIR`). See [Configuration](#configuration) to add or replace dirs. It merges into existing JSON without dropping other keys and prints none of their contents. Running it again changes nothing.
 
 3. **Trust the hook in Codex.** Run `codex`, type `/hooks`, and trust the "Notifying Grok Bot" hook. Trust the `PermissionRequest` one as well. Claude Code has no trust step. See [docs/hooks.md](docs/hooks.md).
 
@@ -91,8 +91,10 @@ README.md                 this file
 ONE-SHOT-PROMPT.md        paste-in prompt for building your own version from scratch
 install.sh                installs the hooks for Codex and every Claude config dir (idempotent)
 uninstall.sh              removes the hook entries again
+hooks/config-lib.sh       shared parser for the optional config file and Claude dir detection
 hooks/notify.sh           Stop hook, approval-prompt pings and sweep: reads marker + status, POSTs to the bot
 hooks/set-webhook.sh      stores one bot's webhook URL + auth in a chmod 600 file
+examples/config.example   optional local config (copy to ~/.grokbot-hooks/config)
 docs/t3-mcp-setup.md      connecting T3 Code's MCP to Grok Bot, and the tools bots use
 docs/hooks.md             hook config per harness, payload schema, debugging
 docs/t3.md                T3 path and existing workflow links
@@ -112,7 +114,7 @@ A thread blocked on a permission prompt has not ended its turn, so Stop never fi
 - **Claude Code:** the `Notification` event (`notify.sh claude-notify`), for permission and input prompts. Other notification types are ignored.
 - **Codex:** the `PermissionRequest` event (`notify.sh codex-permission`). Trust it once in `codex` under `/hooks`, like the Stop hook. Codex's `notify` setting cannot do this: it only supports `agent-turn-complete`.
 
-`install.sh` registers them: `Notification` in every Claude config dir that exists (`~/.claude`, `~/.claude-personal`, `~/.claude-vmg`, plus `$CLAUDE_CONFIG_DIR`) and `PermissionRequest` in `~/.codex/hooks.json`. These pings always send (no dedupe) and never touch `.grokbot-status`. A bot cannot answer the prompt; it should tell the human.
+`install.sh` registers them: `Notification` in every Claude config dir it finds (see [Configuration](#configuration)) and `PermissionRequest` in `~/.codex/hooks.json`. These pings always send (no dedupe) and never touch `.grokbot-status`. A bot cannot answer the prompt; it should tell the human.
 
 As a fallback, the sweep sends `stalled <N>m approval? <status>` when a harness is running in a marked worktree but nothing has changed for `GROKBOT_STALL_MINUTES` (default 45). Details: [docs/hooks.md](docs/hooks.md#approval-prompt-pings).
 
@@ -189,13 +191,30 @@ The plist sets PATH for Homebrew tools. Check its absolute script path before
 loading it. To change the interval, edit `StartInterval` (seconds).
 `GROKBOT_STALE_SECONDS` sets the stale threshold (default `7200`).
 `GROKBOT_HOOKS_DIR` overrides the hooks directory; `GROKBOT_STATE_DIR` overrides
-only the state directory. Set these in the launchd environment too if needed.
+only the state directory. Put the tunables in `~/.grokbot-hooks/config` (below) so
+launchd sees them too; `GROKBOT_HOOKS_DIR` has to be an environment variable.
 
 Run `python3 tests/notify-http-test.py` for local HTTP payload tests for all three paths.
 Run `bash tests/install-test.sh` for the installer and uninstaller against a temporary HOME.
 Run `bash tests/stall-test.sh` for stall watchdog cases.
 Run `bash tests/notify-test.sh` for isolated tests with a stub curl. The tests
 use temporary HOME, hooks, and state directories and make no real HTTP requests.
+
+## Configuration
+
+Everything works with no configuration. To change a default, copy [examples/config.example](examples/config.example) to `~/.grokbot-hooks/config`. It is a plain `KEY=value` file that is parsed, never run as a shell script, so it cannot execute code; only these keys are read and anything else is ignored. `install.sh` never creates, overwrites or deletes it, and it stays out of the repo.
+
+| Key | Meaning |
+| --- | --- |
+| `GROKBOT_CLAUDE_DIRS` | Claude config dirs for `install.sh` and `uninstall.sh`, colon separated like `PATH` (spaces are fine). Replaces the auto-detected list entirely (and ignores `GROKBOT_EXTRA_CLAUDE_DIRS`). |
+| `GROKBOT_EXTRA_CLAUDE_DIRS` | Same format, added to the auto-detected list (not used when `GROKBOT_CLAUDE_DIRS` is set). |
+| `GROKBOT_STALL_MINUTES` | Stall threshold for the sweep (default `45`). |
+| `GROKBOT_STALE_SECONDS` | Stale reminder for `waiting` (default `7200`). |
+| `GROKBOT_STATE_DIR` | Dedupe and stall state directory. |
+
+Precedence: a real (non-empty) environment variable, then the config file, then the default. `notify.sh`, including `--sweep` under launchd, `install.sh` and `uninstall.sh` all read it.
+
+**Claude config dirs.** By default the installer touches `~/.claude`, `$CLAUDE_CONFIG_DIR` if set, and every other `~/.claude-*` directory that contains a `settings.json`, each once. Symlinked `~/.claude-*` entries, files, and names that look like backups (`*.bak*`, `*.backup*`, `*.old`, `*.orig`) are skipped, and only existing directories are used. If you run Claude Code with one `CLAUDE_CONFIG_DIR` per provider or account and the dirs live elsewhere, list them in `GROKBOT_EXTRA_CLAUDE_DIRS`. Run `./uninstall.sh` with the same config to remove the hooks from the same dirs.
 
 ## Design decisions
 

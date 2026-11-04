@@ -87,4 +87,15 @@ mv "$GROKBOT_HOOKS_DIR/two.env" "$TMP/two.env"
 sweep; count 5
 mv "$TMP/two.env" "$GROKBOT_HOOKS_DIR/two.env"
 sweep; count 6
-echo 'PASS: stall age, dedupe, reset, ping clock, active harness, failed check, done, waiting, bot routing, threshold'
+# Local config file ($GROKBOT_HOOKS_DIR/config): its threshold applies when the environment sets
+# none, and a real environment variable beats it. The file is parsed, never run.
+cp "$REPO/hooks/config-lib.sh" "$GROKBOT_HOOKS_DIR/"
+unset GROKBOT_STALL_MINUTES
+printf 'GROKBOT_STALL_MINUTES=1\ntouch "%s/ran"\n' "$TMP" > "$GROKBOT_HOOKS_DIR/config"
+printf 'idle config file\n' > "$WORK/.grokbot-status"
+age 2; old_clock
+GROKBOT_STALL_MINUTES=60 sweep; count 6
+sweep; count 7
+jq -e 'select(.status | startswith("stalled 2m idle config file"))' "$CALLS"
+[ ! -e "$TMP/ran" ] || { echo 'FAIL: config file ran code'; exit 1; }
+echo 'PASS: stall age, dedupe, reset, ping clock, active harness, failed check, done, waiting, bot routing, threshold, config file'

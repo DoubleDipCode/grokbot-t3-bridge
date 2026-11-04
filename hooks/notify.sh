@@ -4,6 +4,12 @@
 # and --sweep, which checks saved worktrees for stalls (no harness, or a running harness gone quiet).
 HARNESS="${1:-unknown}"
 DIR="${GROKBOT_HOOKS_DIR:-$HOME/.grokbot-hooks}"
+[ -d "$DIR" ] || exit 0  # not installed
+# Optional local config ($DIR/config, KEY=value lines, parsed and never sourced). Real environment
+# variables win over it. Also read for --sweep under launchd, which has no shell profile.
+# config-lib.sh is installed next to this script; without it only environment variables apply.
+# shellcheck source=hooks/config-lib.sh
+[ ! -f "$DIR/config-lib.sh" ] || { . "$DIR/config-lib.sh" && grokbot_load_config "$DIR/config"; } || true
 STATE="${GROKBOT_STATE_DIR:-$DIR/state}"
 STALE="${GROKBOT_STALE_SECONDS:-7200}"
 case "$STALE" in *[!0-9]*|'') STALE=7200 ;; esac
@@ -11,7 +17,6 @@ STALL_MINUTES="${GROKBOT_STALL_MINUTES:-45}"
 case "$STALL_MINUTES" in *[!0-9]*|'') STALL_MINUTES=45 ;; esac
 LOG="$DIR/notify.log"
 MAP="$DIR/markers.tsv"   # worktree<TAB>bot, so a removed or switched worktree can still be reported
-[ -d "$DIR" ] || exit 0  # not installed
 umask 077                # anything this script creates (log, map) is private to the user
 # launchd's PATH has no /usr/sbin, where macOS keeps lsof. Without it harness_running cannot
 # tell and the sweep silently skips every stall ping while a harness process exists.
@@ -206,7 +211,14 @@ recently_active() {
   # Session transcript: the path saved by the last Stop ping, and Claude's per-directory
   # project logs. These keep changing during a long agent turn even with no file edits.
   slug="$(printf '%s' "$path" | sed 's/[^A-Za-z0-9]/-/g')"
-  for d in "$HOME"/.claude/projects/"$slug" "$HOME"/.claude-*/projects/"$slug"; do
+  # Also the dirs named by GROKBOT_CLAUDE_DIRS / GROKBOT_EXTRA_CLAUDE_DIRS / CLAUDE_CONFIG_DIR.
+  local extra=() p dirs=()
+  IFS=: read -r -a extra <<< "${GROKBOT_CLAUDE_DIRS:-}:${GROKBOT_EXTRA_CLAUDE_DIRS:-}:${CLAUDE_CONFIG_DIR:-}"
+  dirs=("$HOME/.claude/projects/$slug" "$HOME"/.claude-*/projects/"$slug")
+  for p in ${extra[@]+"${extra[@]}"}; do
+    [ -z "$p" ] || dirs+=("${p%/}/projects/$slug")
+  done
+  for d in "${dirs[@]}"; do
     [ -d "$d" ] || continue
     [ -n "$(find "$d" -maxdepth 1 -name '*.jsonl' -mmin "-$STALL_MINUTES" -print -quit 2>/dev/null)" ] && return 0
   done

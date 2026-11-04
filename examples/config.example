@@ -1,0 +1,32 @@
+# Optional local config for the Grok Bot hooks. Copy it to ~/.grokbot-hooks/config:
+#
+#   cp examples/config.example ~/.grokbot-hooks/config
+#
+# install.sh never creates, overwrites or deletes that file, and it is not part of the repo.
+#
+# Format: one KEY=value per line. Blank lines and lines starting with # are ignored. Values may be
+# wrapped in single or double quotes. The file is parsed, not run as a shell script: only the keys
+# below are read, nothing is expanded, and any other line is ignored. The one exception is a leading
+# ~ or $HOME in the directory keys, which becomes your home directory.
+#
+# Precedence: a real (non-empty) environment variable > this file > the built-in default.
+# notify.sh and install.sh/uninstall.sh read this file, including `notify.sh --sweep` under launchd,
+# which has no shell profile of its own. Remove the leading # to enable a line.
+
+# Claude config dirs that install.sh/uninstall.sh touch, colon separated like PATH (spaces are fine).
+# By default they are auto-detected: ~/.claude, $CLAUDE_CONFIG_DIR and every ~/.claude-* directory
+# that contains a settings.json. Setting this replaces that list entirely (extras are ignored).
+# GROKBOT_CLAUDE_DIRS=~/.claude:~/.claude-work
+
+# Extra Claude config dirs to add to the auto-detected list (for example one per provider,
+# each launched with its own CLAUDE_CONFIG_DIR somewhere outside your home directory).
+# GROKBOT_EXTRA_CLAUDE_DIRS=/srv/claude/team-a:/srv/claude/team-b
+
+# Minutes without a status change or ping before the sweep sends a stall alert (default 45).
+# GROKBOT_STALL_MINUTES=45
+
+# Seconds before a "waiting" status gets one stale reminder (default 7200).
+# GROKBOT_STALE_SECONDS=7200
+
+# Directory for dedupe and stall state (default: state/ inside ~/.grokbot-hooks).
+# GROKBOT_STATE_DIR=~/.grokbot-hooks/state

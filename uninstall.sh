@@ -1,10 +1,14 @@
 #!/bin/bash
 # Remove the Grok Bot hook entries (Stop, Notification, PermissionRequest) from Codex and
-# every Claude Code config dir. Other keys and other hooks are left alone.
-# Leaves ~/.grokbot-hooks (scripts, logs and <bot>.env files) in place; delete it yourself if you want.
+# every Claude Code config dir found the same way install.sh finds them. Other keys and other hooks are left alone.
+# Leaves ~/.grokbot-hooks (scripts, config, logs and <bot>.env files) in place; delete it yourself if you want.
 set -euo pipefail
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
 STAMP="$(date +%Y%m%d-%H%M%S)"
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=hooks/config-lib.sh
+. "$SRC/hooks/config-lib.sh"
+grokbot_load_config "$HOME/.grokbot-hooks/config"
 
 remove_hooks() {
   local file="$1" tmp
@@ -33,15 +37,8 @@ remove_hooks() {
 }
 
 remove_hooks "$HOME/.codex/hooks.json"
-CLAUDE_DIRS=()
-if [ -n "${GROKBOT_CLAUDE_DIRS:-}" ]; then
-  IFS=: read -r -a CLAUDE_DIRS <<< "$GROKBOT_CLAUDE_DIRS"
-else
-  CLAUDE_DIRS=("$HOME/.claude" "$HOME/.claude-personal" "$HOME/.claude-vmg")
-fi
-[ -z "${CLAUDE_CONFIG_DIR:-}" ] || CLAUDE_DIRS+=("$CLAUDE_CONFIG_DIR")
-for dir in "${CLAUDE_DIRS[@]}"; do
-  [ -n "$dir" ] || continue
-  remove_hooks "${dir%/}/settings.json"
+grokbot_resolve_claude_dirs
+for dir in ${CLAUDE_DIRS[@]+"${CLAUDE_DIRS[@]}"}; do
+  remove_hooks "$dir/settings.json"
 done
 echo "Done. ~/.grokbot-hooks was left in place."
