@@ -106,10 +106,21 @@ hasnt "$HOME/only here" && hasnt "$HOME/.claude-real" || { echo 'FAIL: uninstall
 GROKBOT_CLAUDE_DIRS="$TMP/envdir" bash "$REPO/install.sh" >/dev/null 2>&1
 has "$TMP/envdir" || { echo 'FAIL: env override not used'; exit 1; }
 hasnt "$HOME/only here" && hasnt "$HOME/.claude-real" || { echo 'FAIL: config beat the environment'; exit 1; }
+# A full override ignores GROKBOT_EXTRA_CLAUDE_DIRS from the config file.
+printf 'GROKBOT_EXTRA_CLAUDE_DIRS=%s\n' "$TMP/ext dir" > "$CFG"
+GROKBOT_CLAUDE_DIRS="$TMP/envdir" bash "$REPO/install.sh" >/dev/null 2>&1
+hasnt "$TMP/ext dir" || { echo 'FAIL: extra dirs added to a full override'; exit 1; }
 # The sourced parser itself: precedence, quoting, inline comments.
 (
   . "$REPO/hooks/config-lib.sh"
   printf 'GROKBOT_STALL_MINUTES=12 # inline\nGROKBOT_STALE_SECONDS="300"\nGROKBOT_STATE_DIR='"'"'~/st ate'"'"'\n' > "$TMP/c"
+  GROKBOT_STALE_SECONDS=99
+  grokbot_load_config "$TMP/c"
+  printf 'GROKBOT_CLAUDE_DIRS="~/only" # comment\nGROKBOT_STALL_MINUTES='"'"'3'"'"'   # c\nGROKBOT_STALE_SECONDS="x\n' > "$TMP/c2"
+  unset GROKBOT_CLAUDE_DIRS GROKBOT_STALL_MINUTES GROKBOT_STALE_SECONDS
+  grokbot_load_config "$TMP/c2"
+  [ "$GROKBOT_CLAUDE_DIRS" = "$HOME/only" ] && [ "$GROKBOT_STALL_MINUTES" = 3 ] && [ -z "${GROKBOT_STALE_SECONDS:-}" ] || { echo "FAIL: quoted values ($GROKBOT_CLAUDE_DIRS $GROKBOT_STALL_MINUTES)"; exit 1; }
+  unset GROKBOT_CLAUDE_DIRS GROKBOT_STALL_MINUTES GROKBOT_STATE_DIR
   GROKBOT_STALE_SECONDS=99
   grokbot_load_config "$TMP/c"
   [ "$GROKBOT_STALL_MINUTES" = 12 ] && [ "$GROKBOT_STALE_SECONDS" = 99 ] && [ "$GROKBOT_STATE_DIR" = "$HOME/st ate" ] || { echo "FAIL: parser ($GROKBOT_STALL_MINUTES $GROKBOT_STALE_SECONDS $GROKBOT_STATE_DIR)"; exit 1; }

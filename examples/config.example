@@ -15,7 +15,7 @@
 
 # Claude config dirs that install.sh/uninstall.sh touch, colon separated like PATH (spaces are fine).
 # By default they are auto-detected: ~/.claude, $CLAUDE_CONFIG_DIR and every ~/.claude-* directory
-# that contains a settings.json. Setting this replaces that list entirely.
+# that contains a settings.json. Setting this replaces that list entirely (extras are ignored).
 # GROKBOT_CLAUDE_DIRS=~/.claude:~/.claude-work
 
 # Extra Claude config dirs to add to the auto-detected list (for example one per provider,

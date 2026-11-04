@@ -206,8 +206,8 @@ Everything works with no configuration. To change a default, copy [examples/conf
 
 | Key | Meaning |
 | --- | --- |
-| `GROKBOT_CLAUDE_DIRS` | Claude config dirs for `install.sh` and `uninstall.sh`, colon separated like `PATH` (spaces are fine). Replaces the auto-detected list. |
-| `GROKBOT_EXTRA_CLAUDE_DIRS` | Same format, added to the auto-detected list. |
+| `GROKBOT_CLAUDE_DIRS` | Claude config dirs for `install.sh` and `uninstall.sh`, colon separated like `PATH` (spaces are fine). Replaces the auto-detected list entirely (and ignores `GROKBOT_EXTRA_CLAUDE_DIRS`). |
+| `GROKBOT_EXTRA_CLAUDE_DIRS` | Same format, added to the auto-detected list (not used when `GROKBOT_CLAUDE_DIRS` is set). |
 | `GROKBOT_STALL_MINUTES` | Stall threshold for the sweep (default `45`). |
 | `GROKBOT_STALE_SECONDS` | Stale reminder for `waiting` (default `7200`). |
 | `GROKBOT_STATE_DIR` | Dedupe and stall state directory. |

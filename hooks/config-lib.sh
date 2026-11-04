@@ -5,7 +5,7 @@
 #   Reads the optional local config file (default ~/.grokbot-hooks/config). It is NOT sourced:
 #   each line is parsed as KEY=value and only the keys in GROKBOT_CONFIG_KEYS are accepted, so
 #   the file cannot run code. Blank lines and # comments are ignored. Values may be wrapped in
-#   single or double quotes; nothing inside is expanded, except a leading ~ or $HOME in the
+#   single or double quotes (text after the closing quote, such as a # comment, is ignored; an unterminated quote skips the line); nothing inside is expanded, except a leading ~ or $HOME in the
 #   directory keys. A real environment variable (non-empty) always wins over the file.
 #
 # grokbot_resolve_claude_dirs
@@ -33,7 +33,7 @@ grokbot__expand_home() {
 }
 
 grokbot_load_config() {
-  local file="$1" line key value
+  local file="$1" line key value q rest
   [ -f "$file" ] && [ -r "$file" ] || return 0
   while IFS= read -r line || [ -n "$line" ]; do
     line="${line%$'\r'}"
@@ -48,8 +48,13 @@ grokbot_load_config() {
     value="${line#*=}"
     value="${value#"${value%%[![:space:]]*}"}"
     case "$value" in
-      \"*\") [ "${#value}" -ge 2 ] && value="${value:1:${#value}-2}" ;;
-      \'*\') [ "${#value}" -ge 2 ] && value="${value:1:${#value}-2}" ;;
+      \"*|\'*)
+        # Quoted: take what is between the opening quote and the next matching quote; anything
+        # after it (spaces, a # comment) is dropped.
+        q="${value:0:1}"
+        rest="${value:1}"
+        case "$rest" in *"$q"*) value="${rest%%"$q"*}" ;; *) continue ;; esac
+        ;;
       *)
         value="${value%%[[:space:]]#*}"              # trailing " # comment"
         value="${value%"${value##*[![:space:]]}"}"
@@ -70,7 +75,8 @@ grokbot_load_config() {
 #   settings.json. Those auto-detected entries must be real directories (a symlinked
 #   ~/.claude-foo is skipped, it would only repeat another dir) and backup-looking names
 #   (*.bak*, *.backup*, *.old, *.orig) are skipped.
-# GROKBOT_EXTRA_CLAUDE_DIRS (colon separated) is added in both cases.
+# GROKBOT_EXTRA_CLAUDE_DIRS (colon separated) is added to the auto-detected list only; an explicit
+# GROKBOT_CLAUDE_DIRS is a full override and ignores it.
 # Dirs named explicitly (any of the above except the ~/.claude-* scan) are used when they exist,
 # even without a settings.json; missing ones are listed in CLAUDE_DIRS_MISSING.
 grokbot_resolve_claude_dirs() {
@@ -104,10 +110,10 @@ grokbot_resolve_claude_dirs() {
       case "$base" in *.bak*|*.backup*|*.old|*.orig|*~) continue ;; esac
       grokbot__add_dir "$dir"
     done
-  fi
-  if [ -n "${GROKBOT_EXTRA_CLAUDE_DIRS:-}" ]; then
-    IFS=: read -r -a parts <<< "$GROKBOT_EXTRA_CLAUDE_DIRS"
-    for p in ${parts[@]+"${parts[@]}"}; do grokbot__add_dir "$p"; done
+    if [ -n "${GROKBOT_EXTRA_CLAUDE_DIRS:-}" ]; then
+      IFS=: read -r -a parts <<< "$GROKBOT_EXTRA_CLAUDE_DIRS"
+      for p in ${parts[@]+"${parts[@]}"}; do grokbot__add_dir "$p"; done
+    fi
   fi
   unset -f grokbot__add_dir
   return 0
