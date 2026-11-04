@@ -112,6 +112,9 @@ with tempfile.TemporaryDirectory(prefix='grokbot-http-') as temp:
         assert swept['worktree'] == str(work)
         assert swept['session_id'] == swept['transcript_path'] == swept['cwd'] == ''
         invoke('--sweep')
+        assert received.empty()  # One reminder per unchanged waiting status.
+        (work / '.grokbot-status').write_text('waiting new external event')
+        invoke('--sweep')
         swept = received.get(timeout=1)
         assert swept['harness'] == 'sweep'
         assert swept['session_id'] == swept['transcript_path'] == swept['cwd'] == ''
@@ -131,7 +134,7 @@ with tempfile.TemporaryDirectory(prefix='grokbot-http-') as temp:
                 body = received.get(timeout=1)
                 assert body['status'] == expected and body['harness'] == mode, body
                 assert body['worktree'] == str(work)
-        assert (work / '.grokbot-status').read_text() == 'waiting external event'
+        assert (work / '.grokbot-status').read_text() == 'waiting new external event'
         print('PASS: local HTTP, T3/Claude/Codex identity, legacy/null fields, dedupe, sweep isolation, approval pings')
     finally:
         server.shutdown()

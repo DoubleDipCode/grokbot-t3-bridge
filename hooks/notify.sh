@@ -1,15 +1,14 @@
 #!/bin/bash
 # shellcheck disable=SC2016 # Single-quoted expressions are jq programs.
 # Actionable Stop notifications, approval-prompt pings (claude-notify, codex-permission)
-# and --sweep, which checks saved waiting worktrees and stalled running harnesses.
+# and --sweep, which checks saved worktrees for stalls (no harness, or a running harness gone quiet).
 HARNESS="${1:-unknown}"
 DIR="${GROKBOT_HOOKS_DIR:-$HOME/.grokbot-hooks}"
 STATE="${GROKBOT_STATE_DIR:-$DIR/state}"
 STALE="${GROKBOT_STALE_SECONDS:-7200}"
 case "$STALE" in *[!0-9]*|'') STALE=7200 ;; esac
-STALL_MIN="${GROKBOT_STALL_MINUTES:-45}"
-case "$STALL_MIN" in *[!0-9]*|''|0) STALL_MIN=45 ;; esac
-HARNESS_RE="${GROKBOT_HARNESS_RE:-^(claude|codex)\$}"   # process names that count as a running harness
+STALL_MINUTES="${GROKBOT_STALL_MINUTES:-45}"
+case "$STALL_MINUTES" in *[!0-9]*|'') STALL_MINUTES=45 ;; esac
 LOG="$DIR/notify.log"
 MAP="$DIR/markers.tsv"   # worktree<TAB>bot, so a removed or switched worktree can still be reported
 [ -d "$DIR" ] || exit 0  # not installed
@@ -38,6 +37,11 @@ post() {
     --arg branch "$BRANCH" --arg status "$STATUS" --arg last "$LAST" --arg ts "$TS" \
     --arg session "$SESSION" --arg transcript "$TRANSCRIPT" --arg cwd "$SESSION_CWD" \
     '{event:"t3_turn_ended",bot:$bot,harness:$harness,worktree:$worktree,branch:$branch,status:$status,last_message:$last,ended_at:$ts,cwd:$cwd,session_id:$session,transcript_path:$transcript}')" || return 1
+  # Record stall attempts only once a payload and webhook are available.
+  # At most one request per revision, even on HTTP failure or worker crash.
+  if [ "$HARNESS" = sweep ] && [[ "$STATUS" = stalled\ * ]]; then
+    touch "$STATE/$KEY.stalled" || return 1
+  fi
   # Never log curl diagnostics: they can contain a secret URL.
   http="$(curl -sS -m 10 -X POST "$GROKBOT_WEBHOOK_URL" -H 'Content-Type: application/json' \
     ${GROKBOT_WEBHOOK_AUTH:+-H "Authorization: $GROKBOT_WEBHOOK_AUTH"} \
@@ -45,6 +49,27 @@ post() {
   result=$?
   echo "$TS $BOT webhook http=$http result=$result" >> "$LOG"
   [ "$result" -eq 0 ] && [[ "$http" = 2?? ]]
+}
+
+# A live harness is conservative evidence of an active turn, including tool/CI
+# waits. Match executable names in argv, not arbitrary mentions of "codex".
+# lsof is restricted to candidate PIDs and cwd, so no recursive file scan.
+# Returns 0 when one runs in the worktree, 1 when none does, 2 when it cannot tell.
+harness_running() {
+  local pids result cwd root
+  root="$(cd "$1" 2>/dev/null && pwd -P)" || return 2
+  pids="$(pgrep -f '(^|/|[[:space:]])(codex|claude|claude-code|agent-harness)([[:space:]]|$)' 2>/dev/null)"
+  result=$?
+  [ "$result" -eq 1 ] && return 1
+  [ "$result" -eq 0 ] || return 2
+  pids="$(printf '%s' "$pids" | paste -sd, -)"
+  cwd="$(lsof -a -p "$pids" -d cwd -Fn 2>/dev/null)" || return 2
+  while IFS= read -r line; do
+    case "$line" in
+      "n$root"|"n$root/"*) return 0 ;;
+    esac
+  done <<< "$cwd"
+  return 1
 }
 
 process() {
@@ -96,7 +121,19 @@ if [ -n "$TRANSCRIPT" ] && [ "$TRANSCRIPT" != "$SAVED_TRANSCRIPT" ] && [ -f "$CA
 fi
 CLOCK="$("$JQ" -r '.clock // empty' "$CACHE" 2>/dev/null)"
 case "$CLOCK" in *[!0-9]*|'') CLOCK="$NOW"; NOCLOCK=1 ;; *) NOCLOCK= ;; esac
+# Track file changes separately from delivery state. Include high-resolution mtime
+# and inode so rewriting the same line also starts a new stall period.
+REVISION="$(perl -MTime::HiRes=stat -e '
+  my @s = stat($ARGV[0]); print @s ? join(":", @s[1,7,9]) : "missing";
+' "$ROOT/.grokbot-status")"
+OBSERVED="$STATE/$KEY.observed"
+if ! "$JQ" -e --arg revision "$REVISION" --arg status "$STATUS"   '.revision == $revision and .status == $status' "$OBSERVED" >/dev/null 2>&1; then
+  "$JQ" -n --arg revision "$REVISION" --arg status "$STATUS"     '{revision:$revision,status:$status}' > "$OBSERVED.tmp" &&
+    mv -f "$OBSERVED.tmp" "$OBSERVED"
+  rm -f "$STATE/$KEY.stalled" "$STATE/$KEY.waiting"
+fi
 if [ "$WORD" = waiting ]; then
+  [ ! -f "$STATE/$KEY.waiting" ] || return 0
   if [ ! -f "$CACHE" ]; then
     "$JQ" -n --argjson clock "$NOW" '{clock:$clock}' > "$CACHE"
   elif [ -n "$NOCLOCK" ]; then
@@ -108,6 +145,34 @@ if [ "$WORD" = waiting ]; then
     return 0
   fi
   STATUS="stale $STATUS"
+elif [ "$HARNESS" = sweep ] && [ -f "$ROOT/.grokbot" ]; then
+  [ "$WORD" != "done" ] || return 0
+  if [ -f "$STATE/$KEY.stalled" ]; then
+    # Already pinged for this status revision. New activity from a running harness ends that
+    # stall, so a later one (another prompt, same status text) pings again.
+    if harness_running "$ROOT" && recently_active "$ROOT"; then rm -f "$STATE/$KEY.stalled"; fi
+    return 0
+  fi
+  MODIFIED="$(perl -e 'print((stat($ARGV[0]))[9] || (stat($ARGV[1]))[9] || time)'     "$ROOT/.grokbot-status" "$ROOT/.grokbot")"
+  # No previous ping means the file timestamp alone determines age.
+  if [ ! -f "$CACHE" ]; then CLOCK="$MODIFIED"; fi
+  [ "$MODIFIED" -le "$CLOCK" ] || CLOCK="$MODIFIED"
+  AGE=$((NOW - CLOCK))
+  [ "$AGE" -ge "$((STALL_MINUTES * 60))" ] || return 0
+  harness_running "$ROOT"
+  case $? in
+    0)
+      # A harness is alive, so this may be a turn blocked on an approval prompt that no hook
+      # reported. Finished or already actionable statuses are an idle open session, not a stall.
+      case "$WORD" in failed|needs_input|idle) return 0 ;; esac
+      # Long builds and quiet turns: any recent file, git, or session-log activity means working.
+      ! recently_active "$ROOT" || return 0
+      # AGE is measured from the status file or last ping, so it can overstate the quiet time;
+      # every activity probe was quiet for at least GROKBOT_STALL_MINUTES, so report that.
+      STATUS="stalled ${STALL_MINUTES}m approval? $STATUS" ;;
+    1) STATUS="stalled $((AGE / 60))m $STATUS" ;;
+    *) return 0 ;;  # pgrep or lsof failed: prefer a missed alert to a false one
+  esac
 elif [ "$WORD" != needs_input ] && [ "$WORD" != failed ] &&
   "$JQ" -e --arg status "$STATUS" '.status == $status' "$CACHE" >/dev/null 2>&1; then
   echo "$TS $HARNESS skip=duplicate $ROOT" >> "$LOG"
@@ -119,39 +184,20 @@ echo "$TS $HARNESS bot=$BOT branch=$BRANCH status=$(printf '%s' "$STATUS" | head
 post
 RC=$?
 if [ "$RC" -eq 0 ]; then
+  [ "$WORD" != waiting ] || touch "$STATE/$KEY.waiting"
   "$JQ" -n --arg status "$STATUS" --arg transcript "${TRANSCRIPT:-$SAVED_TRANSCRIPT}" --argjson clock "$(date +%s)" \
     '{status:$status,clock:$clock,transcript:$transcript}' > "$CACHE.tmp" && mv -f "$CACHE.tmp" "$CACHE"
 fi
-}
-
-# Lazily list the working directories of running harness processes (claude, codex).
-# Empty when ps or lsof is unavailable, which disables the stall check rather than guessing.
-load_harness_cwds() {
-  [ -z "${HCWDS_LOADED:-}" ] || return 0
-  HCWDS_LOADED=1
-  HCWDS=
-  local pids lsof
-  pids="$(ps -axo pid=,comm= 2>/dev/null | awk -v re="$HARNESS_RE" \
-    '{p=$1; $1=""; sub(/^ +/,""); n=split($0,a,"/"); if (a[n] ~ re) printf "%s%s", (c++ ? "," : ""), p}')"
-  [ -n "$pids" ] || return 0
-  lsof="$(command -v lsof 2>/dev/null || echo /usr/sbin/lsof)"
-  HCWDS="$("$lsof" -a -d cwd -Fn -p "$pids" 2>/dev/null | sed -n 's/^n//p')"
-}
-
-harness_running_in() {
-  load_harness_cwds
-  [ -n "$HCWDS" ] || return 1
-  printf '%s\n' "$HCWDS" | awk -v r="$1" '$0==r || index($0, r "/")==1 {f=1} END{exit !f}'
 }
 
 # Succeeds when there is any sign of life newer than GROKBOT_STALL_MINUTES in a worktree.
 recently_active() {
   local path="$1" gitdir slug d
   # Files in the worktree, ignoring .git and node_modules. Build outputs count as activity.
-  [ -n "$(find "$path" \( -name .git -o -name node_modules \) -prune -o -type f -mmin "-$STALL_MIN" -print -quit 2>/dev/null)" ] && return 0
+  [ -n "$(find "$path" \( -name .git -o -name node_modules \) -prune -o -type f -mmin "-$STALL_MINUTES" -print -quit 2>/dev/null)" ] && return 0
   # Git metadata: commits, staging and checkouts touch these and nothing in the tree.
   gitdir="$(git -C "$path" rev-parse --absolute-git-dir 2>/dev/null)"
-  if [ -n "$gitdir" ] && [ -n "$(find "$gitdir/index" "$gitdir/HEAD" "$gitdir/logs/HEAD" -mmin "-$STALL_MIN" -print -quit 2>/dev/null)" ]; then
+  if [ -n "$gitdir" ] && [ -n "$(find "$gitdir/index" "$gitdir/HEAD" "$gitdir/logs/HEAD" -mmin "-$STALL_MINUTES" -print -quit 2>/dev/null)" ]; then
     return 0
   fi
   # Session transcript: the path saved by the last Stop ping, and Claude's per-directory
@@ -159,73 +205,22 @@ recently_active() {
   slug="$(printf '%s' "$path" | sed 's/[^A-Za-z0-9]/-/g')"
   for d in "$HOME"/.claude/projects/"$slug" "$HOME"/.claude-*/projects/"$slug"; do
     [ -d "$d" ] || continue
-    [ -n "$(find "$d" -maxdepth 1 -name '*.jsonl' -mmin "-$STALL_MIN" -print -quit 2>/dev/null)" ] && return 0
+    [ -n "$(find "$d" -maxdepth 1 -name '*.jsonl' -mmin "-$STALL_MINUTES" -print -quit 2>/dev/null)" ] && return 0
   done
   local saved
   saved="$("$JQ" -r '.transcript // empty' "$STATE/$(printf '%s' "$path" | shasum -a 256 | awk '{print $1}').json" 2>/dev/null)"
-  if [ -n "$saved" ] && [ -f "$saved" ] && [ -n "$(find "$saved" -mmin "-$STALL_MIN" -print -quit 2>/dev/null)" ]; then
+  if [ -n "$saved" ] && [ -f "$saved" ] && [ -n "$(find "$saved" -mmin "-$STALL_MINUTES" -print -quit 2>/dev/null)" ]; then
     return 0
   fi
   return 1
 }
 
-# A harness is running in a marked worktree, its last status was not a finished one, and
-# nothing has changed for GROKBOT_STALL_MINUTES: it may be blocked on an approval prompt.
-# One ping per stall: the status file's mtime identifies the stall, and any later activity
-# clears the flag, so a second stall in the same worktree pings again.
-stall_check() {
-  local path="$1" status_file="$1/.grokbot-status" word mtime cache
-  word="$(awk 'NR==1 {print $1; exit}' "$status_file" 2>/dev/null)"
-  case "$word" in
-    # Finished or already actionable statuses were pinged at turn end, and waiting has its own
-    # stale timer. An open idle session with one of these is normal, not a stall.
-    done|failed|needs_input|idle|waiting) return 0 ;;
-  esac
-  harness_running_in "$path" || return 0
-  cache="$STATE/$(printf '%s' "$path" | shasum -a 256 | awk '{print $1}').json"
-  if recently_active "$path"; then
-    if "$JQ" -e 'has("stall_status_mtime")' "$cache" >/dev/null 2>&1; then
-      "$JQ" 'del(.stall_status_mtime)' "$cache" > "$cache.tmp" && mv -f "$cache.tmp" "$cache"
-    fi
-    return 0
-  fi
-  mtime="$(stat -c %Y "$status_file" 2>/dev/null || stat -f %m "$status_file" 2>/dev/null || echo 0)"
-  if "$JQ" -e --argjson m "$mtime" '.stall_status_mtime == $m' "$cache" >/dev/null 2>&1; then
-    return 0  # already pinged for this stall
-  fi
-  # The bot comes from the marker itself, as in process().
-  BOT="$(head -n1 "$path/.grokbot" 2>/dev/null | tr -cd 'a-z0-9_-')"
-  [ -n "$BOT" ] || return 0
-  ROOT="$path"
-  HARNESS=sweep
-  SESSION=
-  TRANSCRIPT=
-  SESSION_CWD=
-  LAST=
-  TS="$(date '+%Y-%m-%dT%H:%M:%S%z')"
-  BRANCH="$(git -C "$path" branch --show-current 2>/dev/null)"
-  # N is the threshold: every probe was quiet for at least that long. Sweeps run every
-  # few minutes, so the real figure is within one sweep interval of it.
-  STATUS="stalled ${STALL_MIN}m approval? $( { [ -f "$status_file" ] && head -c 1900 "$status_file" || printf turn_ended_no_status; } )"
-  echo "$TS sweep bot=$BOT branch=$BRANCH status=$(printf '%s' "$STATUS" | head -n1 | head -c 80)" >> "$LOG"
-  if post; then
-    { "$JQ" --argjson m "$mtime" '. + {stall_status_mtime:$m}' "$cache" 2>/dev/null ||
-      "$JQ" -n --argjson m "$mtime" '{stall_status_mtime:$m}'; } > "$cache.tmp" && mv -f "$cache.tmp" "$cache"
-  fi
-}
-
 sweep() {
-  # Waiting and missing markers need periodic attention; do not replay done.
-  # A running harness whose worktree has gone quiet gets a stall check.
+  # Check all known worktrees; process preserves missing-marker delivery.
   while IFS=$'\t' read -r path bot; do
     [ -n "$path" ] && [ -n "$bot" ] || continue
     [ "$path" = "$CURRENT" ] && continue
-    if [ ! -f "$path/.grokbot" ] ||
-      [ "$(awk 'NR==1 {print $1; exit}' "$path/.grokbot-status" 2>/dev/null)" = waiting ]; then
-      process "$path" sweep ""
-    elif [ -d "$path" ]; then
-      stall_check "$path" "$bot"
-    fi
+    process "$path" sweep ""
   done < "$MAP"
 }
 

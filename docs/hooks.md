@@ -99,13 +99,14 @@ Checked on 2026-11-04 against the [Claude hooks reference](https://code.claude.c
 
 ### Stall fallback in the sweep
 
-Hooks can miss a prompt (older harness, hook not trusted, config dir not registered). `notify.sh --sweep`, and the background sweep every hook run starts, also sends one `stalled <N>m approval? <original status>` ping when all of these hold:
+Hooks can miss a prompt (older harness, hook not trusted, config dir not registered). The sweep (`notify.sh --sweep`, and the background sweep every hook run starts) has two stall pings. Both use `GROKBOT_STALL_MINUTES` (default `45`), the same age rule (newer of the status-file mtime and the last successful ping) and the same one-attempt-per-status-revision dedupe:
 
-1. The marked worktree's status word is not `done`, `failed`, `needs_input`, `idle` or `waiting`. Those were already pinged at turn end, `waiting` has its own stale timer, and an idle session left open is normal. So `milestone ...`, `continuing`, no status file, and other words qualify.
-2. A `claude` or `codex` process has that worktree (or a subdirectory) as its working directory (`ps` plus `lsof`; override the process-name regex with `GROKBOT_HARNESS_RE`).
-3. For `GROKBOT_STALL_MINUTES` (default `45`) none of these changed: any file in the worktree except `.git` and `node_modules` (so build output counts, which spares long builds), the git `index`, `HEAD` and `logs/HEAD`, the newest Claude session log in `~/.claude*/projects/<worktree path>/`, and the transcript path saved by the last Stop ping.
+- **No harness running:** `stalled <N>m <original status>`, N being the real age.
+- **A harness is running** in the worktree (or a subdirectory) but it has gone quiet: `stalled <N>m approval? <original status>`. Extra conditions:
+  1. The status word is not `failed`, `needs_input` or `idle` (`done` and `waiting` are excluded for both variants). Those were pinged at turn end, and an idle open session is normal. So `milestone ...`, `continuing`, no status file and other words qualify.
+  2. For `GROKBOT_STALL_MINUTES` none of these changed: any file in the worktree except `.git` and `node_modules` (so build output counts, which spares long builds), the git `index`, `HEAD` and `logs/HEAD`, the newest Claude session log in `~/.claude*/projects/<worktree path>/`, and the transcript path saved by the last Stop ping.
 
-`N` is the threshold, so read it as "at least N minutes". One ping per stall: the status file's mtime is recorded in the state cache, and any later activity clears it, so a second stall pings again. A long task that writes no files and no session log for 45 minutes (a silent test run, say) can still false-positive once. Raise `GROKBOT_STALL_MINUTES` for such projects. If `ps` or `lsof` is unavailable the check does nothing. A thread that sits at a prompt after a turn that wrote `done` is not detected by the sweep; only the hook covers that case.
+For the `approval?` variant `N` is the threshold ("at least N minutes"), because the age rule can overstate the quiet time. New activity from a running harness clears the revision's stall flag, so a second stall with the same status text pings again. A long task that writes no files and no session log for 45 minutes (a silent test run, say) can still false-positive once; raise `GROKBOT_STALL_MINUTES` for such projects. A thread blocked after a turn that wrote `done` is not detected by the sweep; only the hook covers that case. Harness detection is the `pgrep` plus `lsof` check described in the README; if it fails, the sweep sends neither variant.
 
 ## What the script does
 
@@ -179,9 +180,10 @@ compares status only; new metadata does not force delivery.
 | `done` | The agent says the work is finished. The rest is its note, usually with the PR URL. |
 | `needs_input` | The agent needs a decision. The rest is the question and options. |
 | `failed` | The agent is stuck. The rest says what blocked it. |
+| `stalled` | No status change or successful ping for 45 minutes (override: `GROKBOT_STALL_MINUTES`), with no running harness. One attempt per revision. |
 | `turn_ended_no_status` | The worktree has a marker but no `.grokbot-status`. Read the thread. |
 | `needs_input approval <summary>` | Mid-turn: the harness is blocked on an approval or input prompt. Sent by `claude-notify` / `codex-permission`, harness field is that mode name. A bot cannot answer it; tell the human. |
-| `stalled <N>m approval? <status>` | Sweep only (`harness: "sweep"`): a harness is running but nothing has changed for N minutes. `<status>` is the worktree's last status text. |
+| `stalled <N>m approval? <status>` | Sweep only (`harness: "sweep"`): a harness is running but nothing has changed for N minutes; it may be blocked on an approval prompt. `<status>` is the worktree's last status text. |
 | `worktree_missing` | The worktree is known from `markers.tsv` but has no marker now (removed, or the session's cwd is an old path). The full text is `worktree_missing worktree <path> no longer has a .grokbot marker (deleted or moved); read the thread for its real state`. `branch` is usually empty. Read the thread. |
 
 Request headers: `Content-Type: application/json` and, if set, `Authorization: <value from set-webhook.sh>`.
@@ -226,3 +228,11 @@ cat ~/.grokbot-hooks/markers.tsv
 ```
 
 It is safe to delete this file. It is rebuilt as marked worktrees end turns.
+
+
+The sweep can send `stalled <minutes>m <original status>` after 45 minutes
+without a status change or successful ping (`GROKBOT_STALL_MINUTES` overrides
+the threshold). It excludes `done`, uses the separate two-hour reminder for
+`waiting`, and skips worktrees with a running harness. It attempts one stall
+ping per status revision. Read the thread before taking action. Agents must
+write their normal status; `stalled` is generated by the sweep.

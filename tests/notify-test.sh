@@ -216,7 +216,14 @@ for ((i=0; i<100; i++)); do
   /usr/sbin/lsof -a -d cwd -Fn -p "$fake_harness" 2>/dev/null | grep -q work && break
   sleep 0.05
 done
-backdate() { find "$TMP/work" -exec touch -t 202001010000 {} +; }
+# The stall age starts at the newer of the status mtime and the last successful ping, so age both.
+backdate() {
+  find "$TMP/work" -exec touch -t 202001010000 {} +
+  for state in "$GROKBOT_STATE_DIR"/*.json; do
+    case "$state" in *.observed.json) continue ;; esac
+    jq '.clock = 1' "$state" > "$state.tmp"; mv "$state.tmp" "$state"
+  done
+}
 slug() { printf '%s' "$(cd "$TMP/work" && pwd -P)" | sed 's/[^A-Za-z0-9]/-/g'; }
 printf 'milestone building the thing' > "$TMP/work/.grokbot-status"
 # Recent activity (just written files): no stall.
@@ -243,15 +250,16 @@ rm -rf "$HOME/.claude-test"
 run sweep; total 3
 [ "$(last .status)" = 'stalled 45m approval? milestone another status' ] || { echo "FAIL: stall status 2: $(last .status)"; exit 1; }
 # Finished statuses are not stalls, even with an idle harness open.
-for st in 'done PR' 'idle' 'failed x' 'needs_input q' 'waiting on CI'; do
+for st in 'done PR' 'idle' 'failed x' 'needs_input q'; do
   printf '%s' "$st" > "$TMP/work/.grokbot-status"; backdate
   run sweep
 done
 total 3
-# No harness running in the worktree: no stall ping.
+# No harness running in the worktree: the plain stalled ping from the stall watchdog, no "approval?".
 kill "$fake_harness"; wait "$fake_harness" 2>/dev/null || true
 printf 'milestone orphan' > "$TMP/work/.grokbot-status"; backdate
-run sweep; total 3
+run sweep; total 4
+last .status | grep -q '^stalled [0-9]*m milestone orphan$' || { echo "FAIL: plain stall: $(last .status)"; exit 1; }
 unset GROKBOT_STALL_MINUTES
 
 printf 'PASS: approval pings (Claude Notification, Codex PermissionRequest, filtering, no dedupe), stall sweep, inherited lock on worker death, concurrency, abandoned lock, waiting, idle, dedupe, urgent repeats, unknown, milestone, byte identity, stale sweep/reset, missing marker\n'

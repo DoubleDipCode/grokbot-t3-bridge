@@ -115,6 +115,8 @@ The first word of `.grokbot-status` controls delivery:
 | `idle` | Send. |
 | `needs_input`, `failed` | Always send, even when repeated. |
 | `milestone <what>`, `done ...` | Send. |
+| `stalled <minutes>m <original status>` | Sweep alert after 45 minutes without status changes or successful pings, if no harness is running. One attempt per status revision. |
+| `stalled <N>m approval? <original status>` | Sweep alert when a harness *is* running but nothing has changed for N minutes; it may be blocked on an approval prompt. See [the stall fallback](docs/hooks.md#stall-fallback-in-the-sweep). |
 | `needs_input approval ...` | Not a status-file value: the approval hooks send it mid-turn. Always sent, no dedupe, status file untouched. |
 | Any other word | Send for compatibility. This includes `continuing`, `turn_ended_no_status`, and `worktree_missing`. |
 
@@ -127,15 +129,36 @@ as `skip=waiting` or `skip=duplicate` in `notify.log`.
 
 A waiting worktree gets a `stale waiting ...` notification after 7200 seconds
 since its last successful ping. If it has never sent a ping, the first observed
-waiting status starts the clock. A successful stale ping resets the clock; it
-can recur after another interval. Stale reminders bypass dedupe.
+waiting status starts the clock. One successful stale ping is sent per unchanged waiting status. A status change
+resets this reminder. Stale reminders bypass Stop-hook dedupe.
 
-Every hook invocation starts a background sweep of known waiting worktrees and
+Every hook invocation starts a background sweep of all known marked worktrees and
 missing markers. The current worktree is handled once. `notify.sh --sweep`
 runs the same check in the foreground without reading stdin, so launchd waits
 for completion. Stop-hook checks remain detached. A sweep reads the current marker
 and status files. It does not replay completed work. No check can run while the
 machine is off.
+
+A marked worktree with a status other than `done` or `waiting` gets a
+`stalled <minutes>m <original status>` ping after `GROKBOT_STALL_MINUTES`
+(default `45`). Age starts at the newer of the status file mtime and the last
+successful ping. Without a status file, the marker mtime is used. A status edit
+or rewrite resets stall dedupe. Stall attempts are stored beside the delivery
+cache before POST, so even a failed request is not repeated until status changes.
+
+The sweep uses `pgrep` to select `codex`, `claude`, `claude-code`, and
+`agent-harness` processes, then `lsof` to read only their current directories.
+A directory equal to or inside the worktree suppresses this plain alert. This is cheap
+and also protects turns waiting on CI or E2E: they need not consume CPU.
+macOS supplies both tools; Linux installations need them too. If either check
+fails, the sweep skips the alert. A persistent idle harness in that directory
+also suppresses alerts; this check prefers missed alerts to false alarms during
+a live turn. Custom harness executable names need to be added to the matcher.
+
+When a harness *is* running in the worktree, the sweep instead sends
+`stalled <N>m approval? <original status>` if no file, git or session-log
+activity happened for `GROKBOT_STALL_MINUTES`. See
+[the stall fallback](docs/hooks.md#stall-fallback-in-the-sweep) for the rules.
 
 For checks when there are no Stop events, an optional launchd example runs every
 15 minutes. It is not installed automatically. From this checkout, run these
@@ -154,13 +177,12 @@ launchctl load "$HOME/Library/LaunchAgents/com.grokbot.notify-sweep.plist"
 The plist sets PATH for Homebrew tools. Check its absolute script path before
 loading it. To change the interval, edit `StartInterval` (seconds).
 `GROKBOT_STALE_SECONDS` sets the stale threshold (default `7200`).
-`GROKBOT_STALL_MINUTES` sets the quiet time before a running harness is reported as
-stalled (default `45`; see [the stall fallback](docs/hooks.md#stall-fallback-in-the-sweep)).
 `GROKBOT_HOOKS_DIR` overrides the hooks directory; `GROKBOT_STATE_DIR` overrides
 only the state directory. Set these in the launchd environment too if needed.
 
 Run `python3 tests/notify-http-test.py` for local HTTP payload tests for all three paths.
 Run `bash tests/install-test.sh` for the installer and uninstaller against a temporary HOME.
+Run `bash tests/stall-test.sh` for stall watchdog cases.
 Run `bash tests/notify-test.sh` for isolated tests with a stub curl. The tests
 use temporary HOME, hooks, and state directories and make no real HTTP requests.
 
