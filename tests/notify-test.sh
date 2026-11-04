@@ -211,7 +211,7 @@ export GROKBOT_STALL_MINUTES=45
 ln -s /bin/sleep "$TMP/bin/claude"
 ( cd "$TMP/work" && exec "$TMP/bin/claude" 300 </dev/null >/dev/null 2>&1 ) &
 fake_harness=$!
-trap 'kill "$fake_harness" 2>/dev/null; rm -rf "$TMP"' EXIT
+trap 'kill "$fake_harness" 2>/dev/null || true; rm -rf "$TMP"' EXIT
 for ((i=0; i<100; i++)); do
   /usr/sbin/lsof -a -d cwd -Fn -p "$fake_harness" 2>/dev/null | grep -q work && break
   sleep 0.05

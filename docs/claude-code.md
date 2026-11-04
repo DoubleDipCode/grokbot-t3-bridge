@@ -37,7 +37,9 @@ approval or input):
 
 See [Approval-prompt pings](hooks.md#approval-prompt-pings). T3 sets
 `CLAUDE_CONFIG_DIR` per provider, so add both handlers to every settings file it
-uses; `install.sh` does that for `~/.claude`, `~/.claude-personal` and `~/.claude-vmg`.
+uses; `install.sh` does that for `~/.claude`, `$CLAUDE_CONFIG_DIR` and every other
+`~/.claude-*` directory with a `settings.json`. Extra dirs elsewhere can be listed in
+`GROKBOT_EXTRA_CLAUDE_DIRS` ([Configuration](../README.md#configuration)).
 
 Review the command in `/hooks`. Start a fresh session after configuration changes.
 This is a notification hook: it prints no decision and does not block Claude.

@@ -75,7 +75,9 @@ brief, a prompt, a log or a command line. I will enter them myself in a terminal
      so launchd waits for completion. Use kernel-managed locks (Perl flock is
      available on macOS); do not reclaim PID locks with racy deletion.
      Serialize state changes and sends. Never block the harness on sweep/network work.
-   - Support GROKBOT_HOOKS_DIR, GROKBOT_STATE_DIR and GROKBOT_STALE_SECONDS overrides.
+   - Support GROKBOT_HOOKS_DIR, GROKBOT_STATE_DIR and GROKBOT_STALE_SECONDS overrides, also settable
+     in an optional KEY=value file ~/.grokbot-hooks/config that is parsed, never sourced, with the
+     real environment taking precedence.
      Add temp-directory-only tests with stub curl for waiting, idle, duplicate done,
      repeated needs_input/failed, unknown status, stale sweep and clock reset.
    - Provide an optional launchd plist example with --sweep and StartInterval 900,
