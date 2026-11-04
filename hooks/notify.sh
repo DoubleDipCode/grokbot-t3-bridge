@@ -88,6 +88,12 @@ KEY="$(printf '%s' "$ROOT" | shasum -a 256 | awk '{print $1}')"
 CACHE="$STATE/$KEY.json"
 WORD="$(printf '%s' "$STATUS" | awk 'NR==1 {print $1}')"
 SAVED_TRANSCRIPT="$("$JQ" -r '.transcript // empty' "$CACHE" 2>/dev/null)"
+# Keep the newest transcript path even when this Stop is not sent (dedupe, waiting): the stall
+# check uses it, and a new session in the same worktree must replace the old one's path.
+if [ -n "$TRANSCRIPT" ] && [ "$TRANSCRIPT" != "$SAVED_TRANSCRIPT" ] && [ -f "$CACHE" ]; then
+  "$JQ" --arg t "$TRANSCRIPT" '. + {transcript:$t}' "$CACHE" > "$CACHE.tmp" 2>/dev/null && mv -f "$CACHE.tmp" "$CACHE"
+  SAVED_TRANSCRIPT="$TRANSCRIPT"
+fi
 CLOCK="$("$JQ" -r '.clock // empty' "$CACHE" 2>/dev/null)"
 case "$CLOCK" in *[!0-9]*|'') CLOCK="$NOW"; NOCLOCK=1 ;; *) NOCLOCK= ;; esac
 if [ "$WORD" = waiting ]; then

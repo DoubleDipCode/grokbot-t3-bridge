@@ -37,14 +37,14 @@ bash "$REPO/install.sh" >/dev/null 2>&1
 [ "$(cat "$HOME/.claude-vmg/settings.json")" = '{ broken' ] || { echo 'FAIL: invalid JSON modified'; exit 1; }
 echo '{}' > "$HOME/.claude-vmg/settings.json"; bash "$REPO/install.sh" >/dev/null 2>&1
 # A custom list is honoured and a missing dir is skipped.
-mkdir "$HOME/custom"
-GROKBOT_CLAUDE_DIRS="$HOME/custom $HOME/nope" bash "$REPO/install.sh" >/dev/null 2>&1
-[ "$(cmds "$HOME/custom/settings.json" Notification | grep -c claude-notify)" = 1 ] || { echo 'FAIL: custom dir'; exit 1; }
+mkdir "$HOME/custom dir"
+GROKBOT_CLAUDE_DIRS="$HOME/custom dir:$HOME/nope" bash "$REPO/install.sh" >/dev/null 2>&1
+[ "$(cmds "$HOME/custom dir/settings.json" Notification | grep -c claude-notify)" = 1 ] || { echo 'FAIL: custom dir'; exit 1; }
 [ ! -e "$HOME/nope" ] || { echo 'FAIL: created missing dir'; exit 1; }
 # Uninstall removes ours everywhere and keeps the rest.
 bash "$REPO/uninstall.sh" >/dev/null 2>&1
-GROKBOT_CLAUDE_DIRS="$HOME/custom" bash "$REPO/uninstall.sh" >/dev/null 2>&1
-grep -rl 'grokbot-hooks/notify.sh' "$HOME"/.claude*/settings.json "$HOME/custom/settings.json" "$HOME/.codex/hooks.json" 2>/dev/null | grep -v bak && { echo 'FAIL: hook left behind'; exit 1; }
+GROKBOT_CLAUDE_DIRS="$HOME/custom dir" bash "$REPO/uninstall.sh" >/dev/null 2>&1
+grep -rl 'grokbot-hooks/notify.sh' "$HOME"/.claude*/settings.json "$HOME/custom dir/settings.json" "$HOME/.codex/hooks.json" 2>/dev/null | grep -v bak && { echo 'FAIL: hook left behind'; exit 1; }
 [ "$(jq -r '.env.TOKEN' "$HOME/.claude/settings.json")" = sekret-value ] || { echo 'FAIL: uninstall dropped env'; exit 1; }
 [ "$(cmds "$HOME/.claude/settings.json" Notification)" = 'echo other' ] || { echo 'FAIL: uninstall dropped other hook'; exit 1; }
 printf 'PASS: installer merges Notification/Stop into all Claude config dirs, Codex PermissionRequest, no secrets printed, idempotent, invalid JSON skipped, uninstall\n'

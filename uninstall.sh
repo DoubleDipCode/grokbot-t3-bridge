@@ -33,9 +33,15 @@ remove_hooks() {
 }
 
 remove_hooks "$HOME/.codex/hooks.json"
-CLAUDE_DIRS="${GROKBOT_CLAUDE_DIRS:-$HOME/.claude $HOME/.claude-personal $HOME/.claude-vmg}"
-[ -z "${CLAUDE_CONFIG_DIR:-}" ] || CLAUDE_DIRS="$CLAUDE_DIRS $CLAUDE_CONFIG_DIR"
-for dir in $CLAUDE_DIRS; do
+CLAUDE_DIRS=()
+if [ -n "${GROKBOT_CLAUDE_DIRS:-}" ]; then
+  IFS=: read -r -a CLAUDE_DIRS <<< "$GROKBOT_CLAUDE_DIRS"
+else
+  CLAUDE_DIRS=("$HOME/.claude" "$HOME/.claude-personal" "$HOME/.claude-vmg")
+fi
+[ -z "${CLAUDE_CONFIG_DIR:-}" ] || CLAUDE_DIRS+=("$CLAUDE_CONFIG_DIR")
+for dir in "${CLAUDE_DIRS[@]}"; do
+  [ -n "$dir" ] || continue
   remove_hooks "${dir%/}/settings.json"
 done
 echo "Done. ~/.grokbot-hooks was left in place."

@@ -64,16 +64,22 @@ add_hook "$CODEX_HOOKS" PermissionRequest "$(jq -n --arg cmd "$NOTIFY codex-perm
 
 # 3. Claude Code: every config dir that exists. T3's Claude Personal and Work (VMG) providers
 #    set CLAUDE_CONFIG_DIR to ~/.claude-personal and ~/.claude-vmg, so ~/.claude alone is not enough.
-#    GROKBOT_CLAUDE_DIRS (space separated) replaces the default list; CLAUDE_CONFIG_DIR is added.
+#    GROKBOT_CLAUDE_DIRS (colon separated, like PATH) replaces the default list; CLAUDE_CONFIG_DIR is added.
 echo "Claude Code:"
-CLAUDE_DIRS="${GROKBOT_CLAUDE_DIRS:-$HOME/.claude $HOME/.claude-personal $HOME/.claude-vmg}"
-[ -z "${CLAUDE_CONFIG_DIR:-}" ] || CLAUDE_DIRS="$CLAUDE_DIRS $CLAUDE_CONFIG_DIR"
-SEEN=" "
+CLAUDE_DIRS=()
+if [ -n "${GROKBOT_CLAUDE_DIRS:-}" ]; then
+  IFS=: read -r -a CLAUDE_DIRS <<< "$GROKBOT_CLAUDE_DIRS"
+else
+  CLAUDE_DIRS=("$HOME/.claude" "$HOME/.claude-personal" "$HOME/.claude-vmg")
+fi
+[ -z "${CLAUDE_CONFIG_DIR:-}" ] || CLAUDE_DIRS+=("$CLAUDE_CONFIG_DIR")
+SEEN=$'\n'
 FOUND=0
-for dir in $CLAUDE_DIRS; do
+for dir in "${CLAUDE_DIRS[@]}"; do
   dir="${dir%/}"
-  case "$SEEN" in *" $dir "*) continue ;; esac
-  SEEN="$SEEN$dir "
+  [ -n "$dir" ] || continue
+  case "$SEEN" in *$'\n'"$dir"$'\n'*) continue ;; esac
+  SEEN="$SEEN$dir"$'\n'
   if [ ! -d "$dir" ]; then
     echo "  $dir not found, skipping"
     continue
