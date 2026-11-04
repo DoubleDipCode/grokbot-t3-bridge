@@ -105,6 +105,17 @@ templates/routine-prompt.md   prompt for the "T3 callback" routine
 templates/brief-footer.md     text to append to every brief sent to T3
 ```
 
+## Approval-prompt pings
+
+A thread blocked on a permission prompt has not ended its turn, so Stop never fires. Two more hooks ping the bot while the prompt is open, with status `needs_input approval <summary>`:
+
+- **Claude Code:** the `Notification` event (`notify.sh claude-notify`), for permission and input prompts. Other notification types are ignored.
+- **Codex:** the `PermissionRequest` event (`notify.sh codex-permission`). Trust it once in `codex` under `/hooks`, like the Stop hook. Codex's `notify` setting cannot do this: it only supports `agent-turn-complete`.
+
+`install.sh` registers them: `Notification` in every Claude config dir that exists (`~/.claude`, `~/.claude-personal`, `~/.claude-vmg`, plus `$CLAUDE_CONFIG_DIR`) and `PermissionRequest` in `~/.codex/hooks.json`. These pings always send (no dedupe) and never touch `.grokbot-status`. A bot cannot answer the prompt; it should tell the human.
+
+As a fallback, the sweep sends `stalled <N>m approval? <status>` when a harness is running in a marked worktree but nothing has changed for `GROKBOT_STALL_MINUTES` (default 45). Details: [docs/hooks.md](docs/hooks.md#approval-prompt-pings).
+
 ## Actionable status and stall checks
 
 The first word of `.grokbot-status` controls delivery:

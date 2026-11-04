@@ -13,6 +13,9 @@ LOG="$DIR/notify.log"
 MAP="$DIR/markers.tsv"   # worktree<TAB>bot, so a removed or switched worktree can still be reported
 [ -d "$DIR" ] || exit 0  # not installed
 umask 077                # anything this script creates (log, map) is private to the user
+# launchd's PATH has no /usr/sbin, where macOS keeps lsof. Without it harness_running cannot
+# tell and the sweep silently skips every stall ping while a harness process exists.
+PATH="$PATH:/usr/sbin:/sbin"
 
 # Prefer jq from PATH, fall back to /usr/bin/jq. Hooks often run with a minimal PATH.
 JQ="$(command -v jq 2>/dev/null || echo /usr/bin/jq)"
