@@ -1,6 +1,7 @@
 #!/bin/bash
 # shellcheck disable=SC2016 # Single-quoted expressions are jq programs.
-# Actionable Stop notifications; --sweep checks saved worktrees for stalls.
+# Actionable Stop notifications, approval-prompt pings (claude-notify, codex-permission)
+# and --sweep, which checks saved worktrees for stalls (no harness, or a running harness gone quiet).
 HARNESS="${1:-unknown}"
 DIR="${GROKBOT_HOOKS_DIR:-$HOME/.grokbot-hooks}"
 STATE="${GROKBOT_STATE_DIR:-$DIR/state}"
@@ -22,18 +23,47 @@ if [ -f "$LOG" ] && [ "$(wc -c < "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; t
   mv -f "$LOG" "$LOG.1" 2>/dev/null
 fi
 
+# post: POST the payload built from the globals BOT ROOT HARNESS BRANCH STATUS LAST TS SESSION
+# TRANSCRIPT SESSION_CWD. Returns 0 on HTTP 2xx, 1 on failure, 2 when the bot has no webhook.
+post() {
+  local env="$DIR/$BOT.env" body http result
+  [ -f "$env" ] || return 2
+  GROKBOT_WEBHOOK_URL=
+  GROKBOT_WEBHOOK_AUTH=
+  # shellcheck disable=SC1090
+  . "$env"
+  [ -n "$GROKBOT_WEBHOOK_URL" ] || return 2
+  body="$("$JQ" -n --arg bot "$BOT" --arg harness "$HARNESS" --arg worktree "$ROOT" \
+    --arg branch "$BRANCH" --arg status "$STATUS" --arg last "$LAST" --arg ts "$TS" \
+    --arg session "$SESSION" --arg transcript "$TRANSCRIPT" --arg cwd "$SESSION_CWD" \
+    '{event:"t3_turn_ended",bot:$bot,harness:$harness,worktree:$worktree,branch:$branch,status:$status,last_message:$last,ended_at:$ts,cwd:$cwd,session_id:$session,transcript_path:$transcript}')" || return 1
+  # Record stall attempts only once a payload and webhook are available.
+  # At most one request per revision, even on HTTP failure or worker crash.
+  if [ "$HARNESS" = sweep ] && [[ "$STATUS" = stalled\ * ]]; then
+    touch "$STATE/$KEY.stalled" || return 1
+  fi
+  # Never log curl diagnostics: they can contain a secret URL.
+  http="$(curl -sS -m 10 -X POST "$GROKBOT_WEBHOOK_URL" -H 'Content-Type: application/json' \
+    ${GROKBOT_WEBHOOK_AUTH:+-H "Authorization: $GROKBOT_WEBHOOK_AUTH"} \
+    --data "$body" -o /dev/null -w '%{http_code}' 2>/dev/null)"
+  result=$?
+  echo "$TS $BOT webhook http=$http result=$result" >> "$LOG"
+  [ "$result" -eq 0 ] && [[ "$http" = 2?? ]]
+}
+
 # A live harness is conservative evidence of an active turn, including tool/CI
 # waits. Match executable names in argv, not arbitrary mentions of "codex".
 # lsof is restricted to candidate PIDs and cwd, so no recursive file scan.
+# Returns 0 when one runs in the worktree, 1 when none does, 2 when it cannot tell.
 harness_running() {
   local pids result cwd root
-  root="$(cd "$1" 2>/dev/null && pwd -P)" || return 0
+  root="$(cd "$1" 2>/dev/null && pwd -P)" || return 2
   pids="$(pgrep -f '(^|/|[[:space:]])(codex|claude|claude-code|agent-harness)([[:space:]]|$)' 2>/dev/null)"
   result=$?
   [ "$result" -eq 1 ] && return 1
-  [ "$result" -eq 0 ] || return 0
+  [ "$result" -eq 0 ] || return 2
   pids="$(printf '%s' "$pids" | paste -sd, -)"
-  cwd="$(lsof -a -p "$pids" -d cwd -Fn 2>/dev/null)" || return 0
+  cwd="$(lsof -a -p "$pids" -d cwd -Fn 2>/dev/null)" || return 2
   while IFS= read -r line; do
     case "$line" in
       "n$root"|"n$root/"*) return 0 ;;
@@ -82,8 +112,15 @@ fi
 KEY="$(printf '%s' "$ROOT" | shasum -a 256 | awk '{print $1}')"
 CACHE="$STATE/$KEY.json"
 WORD="$(printf '%s' "$STATUS" | awk 'NR==1 {print $1}')"
+SAVED_TRANSCRIPT="$("$JQ" -r '.transcript // empty' "$CACHE" 2>/dev/null)"
+# Keep the newest transcript path even when this Stop is not sent (dedupe, waiting): the stall
+# check uses it, and a new session in the same worktree must replace the old one's path.
+if [ -n "$TRANSCRIPT" ] && [ "$TRANSCRIPT" != "$SAVED_TRANSCRIPT" ] && [ -f "$CACHE" ]; then
+  "$JQ" --arg t "$TRANSCRIPT" '. + {transcript:$t}' "$CACHE" > "$CACHE.tmp" 2>/dev/null && mv -f "$CACHE.tmp" "$CACHE"
+  SAVED_TRANSCRIPT="$TRANSCRIPT"
+fi
 CLOCK="$("$JQ" -r '.clock // empty' "$CACHE" 2>/dev/null)"
-case "$CLOCK" in *[!0-9]*|'') CLOCK="$NOW" ;; esac
+case "$CLOCK" in *[!0-9]*|'') CLOCK="$NOW"; NOCLOCK=1 ;; *) NOCLOCK= ;; esac
 # Track file changes separately from delivery state. Include high-resolution mtime
 # and inode so rewriting the same line also starts a new stall period.
 REVISION="$(perl -MTime::HiRes=stat -e '
@@ -99,6 +136,9 @@ if [ "$WORD" = waiting ]; then
   [ ! -f "$STATE/$KEY.waiting" ] || return 0
   if [ ! -f "$CACHE" ]; then
     "$JQ" -n --argjson clock "$NOW" '{clock:$clock}' > "$CACHE"
+  elif [ -n "$NOCLOCK" ]; then
+    # A stall marker may have created the cache without a clock; start the waiting clock now.
+    "$JQ" --argjson clock "$NOW" '. + {clock:$clock}' "$CACHE" > "$CACHE.tmp" && mv -f "$CACHE.tmp" "$CACHE"
   fi
   if [ "$((NOW - CLOCK))" -lt "$STALE" ]; then
     echo "$TS $HARNESS skip=waiting $ROOT" >> "$LOG"
@@ -107,15 +147,32 @@ if [ "$WORD" = waiting ]; then
   STATUS="stale $STATUS"
 elif [ "$HARNESS" = sweep ] && [ -f "$ROOT/.grokbot" ]; then
   [ "$WORD" != "done" ] || return 0
-  [ ! -f "$STATE/$KEY.stalled" ] || return 0
+  if [ -f "$STATE/$KEY.stalled" ]; then
+    # Already pinged for this status revision. New activity from a running harness ends that
+    # stall, so a later one (another prompt, same status text) pings again.
+    if harness_running "$ROOT" && recently_active "$ROOT"; then rm -f "$STATE/$KEY.stalled"; fi
+    return 0
+  fi
   MODIFIED="$(perl -e 'print((stat($ARGV[0]))[9] || (stat($ARGV[1]))[9] || time)'     "$ROOT/.grokbot-status" "$ROOT/.grokbot")"
   # No previous ping means the file timestamp alone determines age.
   if [ ! -f "$CACHE" ]; then CLOCK="$MODIFIED"; fi
   [ "$MODIFIED" -le "$CLOCK" ] || CLOCK="$MODIFIED"
   AGE=$((NOW - CLOCK))
   [ "$AGE" -ge "$((STALL_MINUTES * 60))" ] || return 0
-  harness_running "$ROOT" && return 0
-  STATUS="stalled $((AGE / 60))m $STATUS"
+  harness_running "$ROOT"
+  case $? in
+    0)
+      # A harness is alive, so this may be a turn blocked on an approval prompt that no hook
+      # reported. Finished or already actionable statuses are an idle open session, not a stall.
+      case "$WORD" in failed|needs_input|idle) return 0 ;; esac
+      # Long builds and quiet turns: any recent file, git, or session-log activity means working.
+      ! recently_active "$ROOT" || return 0
+      # AGE is measured from the status file or last ping, so it can overstate the quiet time;
+      # every activity probe was quiet for at least GROKBOT_STALL_MINUTES, so report that.
+      STATUS="stalled ${STALL_MINUTES}m approval? $STATUS" ;;
+    1) STATUS="stalled $((AGE / 60))m $STATUS" ;;
+    *) return 0 ;;  # pgrep or lsof failed: prefer a missed alert to a false one
+  esac
 elif [ "$WORD" != needs_input ] && [ "$WORD" != failed ] &&
   "$JQ" -e --arg status "$STATUS" '.status == $status' "$CACHE" >/dev/null 2>&1; then
   echo "$TS $HARNESS skip=duplicate $ROOT" >> "$LOG"
@@ -124,33 +181,38 @@ fi
 
 BRANCH="$(git -C "$ROOT" branch --show-current 2>/dev/null)"
 echo "$TS $HARNESS bot=$BOT branch=$BRANCH status=$(printf '%s' "$STATUS" | head -n1 | head -c 80)" >> "$LOG"
-ENV="$DIR/$BOT.env"
-[ -f "$ENV" ] || return 0
-GROKBOT_WEBHOOK_URL=
-GROKBOT_WEBHOOK_AUTH=
-# shellcheck disable=SC1090
-. "$ENV"
-[ -n "$GROKBOT_WEBHOOK_URL" ] || return 0
-BODY="$("$JQ" -n --arg bot "$BOT" --arg harness "$HARNESS" --arg worktree "$ROOT" \
-  --arg branch "$BRANCH" --arg status "$STATUS" --arg last "$LAST" --arg ts "$TS" \
-  --arg session "$SESSION" --arg transcript "$TRANSCRIPT" --arg cwd "$SESSION_CWD" \
-  '{event:"t3_turn_ended",bot:$bot,harness:$harness,worktree:$worktree,branch:$branch,status:$status,last_message:$last,ended_at:$ts,cwd:$cwd,session_id:$session,transcript_path:$transcript}')" || return 0
-# Record stall attempts only once a payload and webhook are available.
-# At most one request per revision, even on HTTP failure or worker crash.
-if [ "$HARNESS" = sweep ] && [[ "$STATUS" = stalled\ * ]]; then
-  touch "$STATE/$KEY.stalled" || return 0
-fi
-# Never log curl diagnostics: they can contain a secret URL.
-HTTP="$(curl -sS -m 10 -X POST "$GROKBOT_WEBHOOK_URL" -H 'Content-Type: application/json' \
-  ${GROKBOT_WEBHOOK_AUTH:+-H "Authorization: $GROKBOT_WEBHOOK_AUTH"} \
-  --data "$BODY" -o /dev/null -w '%{http_code}' 2>/dev/null)"
-RESULT=$?
-echo "$TS $BOT webhook http=$HTTP result=$RESULT" >> "$LOG"
-if [ "$RESULT" -eq 0 ] && [[ "$HTTP" = 2?? ]]; then
+post
+RC=$?
+if [ "$RC" -eq 0 ]; then
   [ "$WORD" != waiting ] || touch "$STATE/$KEY.waiting"
-  "$JQ" -n --arg status "$STATUS" --argjson clock "$(date +%s)" \
-    '{status:$status,clock:$clock}' > "$CACHE.tmp" && mv -f "$CACHE.tmp" "$CACHE"
+  "$JQ" -n --arg status "$STATUS" --arg transcript "${TRANSCRIPT:-$SAVED_TRANSCRIPT}" --argjson clock "$(date +%s)" \
+    '{status:$status,clock:$clock,transcript:$transcript}' > "$CACHE.tmp" && mv -f "$CACHE.tmp" "$CACHE"
 fi
+}
+
+# Succeeds when there is any sign of life newer than GROKBOT_STALL_MINUTES in a worktree.
+recently_active() {
+  local path="$1" gitdir slug d
+  # Files in the worktree, ignoring .git and node_modules. Build outputs count as activity.
+  [ -n "$(find "$path" \( -name .git -o -name node_modules \) -prune -o -type f -mmin "-$STALL_MINUTES" -print -quit 2>/dev/null)" ] && return 0
+  # Git metadata: commits, staging and checkouts touch these and nothing in the tree.
+  gitdir="$(git -C "$path" rev-parse --absolute-git-dir 2>/dev/null)"
+  if [ -n "$gitdir" ] && [ -n "$(find "$gitdir/index" "$gitdir/HEAD" "$gitdir/logs/HEAD" -mmin "-$STALL_MINUTES" -print -quit 2>/dev/null)" ]; then
+    return 0
+  fi
+  # Session transcript: the path saved by the last Stop ping, and Claude's per-directory
+  # project logs. These keep changing during a long agent turn even with no file edits.
+  slug="$(printf '%s' "$path" | sed 's/[^A-Za-z0-9]/-/g')"
+  for d in "$HOME"/.claude/projects/"$slug" "$HOME"/.claude-*/projects/"$slug"; do
+    [ -d "$d" ] || continue
+    [ -n "$(find "$d" -maxdepth 1 -name '*.jsonl' -mmin "-$STALL_MINUTES" -print -quit 2>/dev/null)" ] && return 0
+  done
+  local saved
+  saved="$("$JQ" -r '.transcript // empty' "$STATE/$(printf '%s' "$path" | shasum -a 256 | awk '{print $1}').json" 2>/dev/null)"
+  if [ -n "$saved" ] && [ -f "$saved" ] && [ -n "$(find "$saved" -mmin "-$STALL_MINUTES" -print -quit 2>/dev/null)" ]; then
+    return 0
+  fi
+  return 1
 }
 
 sweep() {
@@ -193,6 +255,78 @@ locked_worker() {
   ' "$STATE/lock" /bin/bash "$0" --worker "$HARNESS" "$CURRENT" "$MESSAGE" "$SESSION_ID" "$TRANSCRIPT_PATH" "$CWD"
 }
 
+# Approval prompts: claude-notify (Claude Code Notification) and codex-permission (Codex
+# PermissionRequest). Always ping, never dedupe, never touch .grokbot-status or the dedupe
+# cache. Runs without the sweep lock so the ping is not queued behind a sweep.
+approval_summary() {
+  # Sets SUMMARY (one line, 200 bytes at most) and MESSAGE. Returns 1 for notifications that
+  # are not about approval or input, which are ignored.
+  local type tool detail
+  case "$HARNESS" in
+    claude-notify)
+      type="$(printf '%s' "$INPUT" | "$JQ" -r '.notification_type | strings' 2>/dev/null)"
+      MESSAGE="$(printf '%s' "$INPUT" | "$JQ" -r '.message | strings' 2>/dev/null | head -c 1500)"
+      case "$type" in
+        permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input) ;;
+        '') # Older versions send no type: only the permission message is about approval.
+          case "$MESSAGE" in *[Pp]ermission*) ;; *) return 1 ;; esac ;;
+        *) return 1 ;;  # idle_prompt (turn-end pings cover it), auth_success, quota_*, ...
+      esac
+      # Best effort: the notification text names the tool, the transcript has the command.
+      if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
+        detail="$(tail -n 15 "$TRANSCRIPT_PATH" 2>/dev/null | "$JQ" -rR 'fromjson? | select(.type=="assistant")
+          | .message.content[]? | select(.type=="tool_use")
+          | "\(.name): \(.input.command // .input.description // .input.file_path // .input.url // "")"' 2>/dev/null | tail -n 1)"
+      fi
+      SUMMARY="${detail:-$MESSAGE}"
+      ;;
+    codex-permission)
+      tool="$(printf '%s' "$INPUT" | "$JQ" -r '.tool_name | strings' 2>/dev/null)"
+      detail="$(printf '%s' "$INPUT" | "$JQ" -r '.tool_input | if type=="object" then (.description // .command // "" | if type=="array" then join(" ") else tostring end) else "" end' 2>/dev/null)"
+      MESSAGE="$tool${detail:+: $detail}"
+      SUMMARY="$MESSAGE"
+      ;;
+  esac
+  SUMMARY="$(printf '%s' "$SUMMARY" | tr '\n\r\t' '   ' | head -c 200)"
+  [ -n "$SUMMARY" ] || SUMMARY="(no details)"
+}
+
+approval() {
+  local d top root bot
+  approval_summary || exit 0
+  d="$(cd "$CWD" 2>/dev/null && pwd -P || echo "$CWD")"
+  top="$(git -C "$d" rev-parse --show-toplevel 2>/dev/null || echo "$d")"
+  root=
+  while :; do
+    [ -f "$d/.grokbot" ] && { root="$d"; break; }
+    [ "$d" = "$top" ] || [ "$d" = / ] || [ "$d" = . ] && break
+    d="$(dirname "$d")"
+  done
+  TS="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  if [ -n "$root" ]; then
+    bot="$(head -n1 "$root/.grokbot" | tr -cd 'a-z0-9_-')"
+  else
+    # Marker removed with the worktree: fall back to the marker map, as Stop does.
+    root="$top"
+    bot="$(awk -F'\t' -v r="$root" '$1==r {b=$2} END{print b}' "$MAP" 2>/dev/null | tr -cd 'a-z0-9_-')"
+  fi
+  if [ -z "$bot" ]; then
+    echo "$TS $HARNESS no-marker $top" >> "$LOG"
+    exit 0
+  fi
+  BOT="$bot"
+  ROOT="$root"
+  SESSION="$SESSION_ID"
+  TRANSCRIPT="$TRANSCRIPT_PATH"
+  SESSION_CWD="$CWD"
+  LAST="$MESSAGE"
+  BRANCH="$(git -C "$ROOT" branch --show-current 2>/dev/null)"
+  STATUS="needs_input approval $SUMMARY"
+  echo "$TS $HARNESS bot=$BOT branch=$BRANCH status=$(printf '%s' "$STATUS" | head -c 80)" >> "$LOG"
+  ( post </dev/null >/dev/null 2>&1; echo "$(date '+%Y-%m-%dT%H:%M:%S%z') worker-complete" >> "$LOG" ) &
+  wait
+}
+
 CURRENT=
 SESSION_ID=
 TRANSCRIPT_PATH=
@@ -204,6 +338,12 @@ if [ "$HARNESS" != --sweep ]; then
   [ -n "$CWD" ] || CWD="$PWD"
   SESSION_ID="$(printf '%s' "$INPUT" | "$JQ" -r '.session_id | strings' 2>/dev/null)"
   TRANSCRIPT_PATH="$(printf '%s' "$INPUT" | "$JQ" -r '.transcript_path | strings' 2>/dev/null)"
+  case "$HARNESS" in
+    claude-notify|codex-permission)
+      # Background everything, including the filtering, so the harness never waits on us.
+      ( approval </dev/null >/dev/null 2>&1 & ) >/dev/null 2>&1
+      exit 0 ;;
+  esac
   CURRENT="$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null || echo "$CWD")"
   MESSAGE="$(printf '%s' "$INPUT" | "$JQ" -r '.last_assistant_message // empty' 2>/dev/null | head -c 1500)"
 fi

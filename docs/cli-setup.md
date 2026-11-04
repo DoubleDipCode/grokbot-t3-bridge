@@ -67,7 +67,9 @@ prompt. It cannot run a resume command or read local transcripts.
 
 There is no T3 remote thread read, interrupt, or approval UI in this path. The bot
 can read captured headless output or local history only when it has access.
-Approval prompts are not completed turns. A human must handle interactive
+Approval prompts are not completed turns, so Stop does not fire for them. The
+`claude-notify` and `codex-permission` hooks ping while the prompt is still open,
+but only a human can answer it. A human must handle interactive
 approvals; headless commands can deny tools or fail if permission is absent.
 Choose permissions for the task before launch. Do not bypass approvals just to
 make callbacks work.

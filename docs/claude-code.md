@@ -17,6 +17,28 @@ Follow [shared CLI setup](cli-setup.md), then add this handler to
 }
 ```
 
+To be pinged while Claude waits on an approval prompt, also register the
+`Notification` event (no matcher: the script ignores types that are not about
+approval or input):
+
+```json
+{
+  "hooks": {
+    "Notification": [{
+      "hooks": [{
+        "type": "command",
+        "command": "\"/absolute/home/.grokbot-hooks/notify.sh\" claude-notify",
+        "timeout": 15
+      }]
+    }]
+  }
+}
+```
+
+See [Approval-prompt pings](hooks.md#approval-prompt-pings). T3 sets
+`CLAUDE_CONFIG_DIR` per provider, so add both handlers to every settings file it
+uses; `install.sh` does that for `~/.claude`, `~/.claude-personal` and `~/.claude-vmg`.
+
 Review the command in `/hooks`. Start a fresh session after configuration changes.
 This is a notification hook: it prints no decision and does not block Claude.
 The Stop input includes `session_id`, `transcript_path`, `cwd`,

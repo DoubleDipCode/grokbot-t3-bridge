@@ -127,4 +127,139 @@ for ((i=0; i<300; i++)); do
 done
 bash "$REPO/hooks/notify.sh" --sweep
 count 15
-printf 'PASS: inherited lock on worker death, concurrency, abandoned lock, waiting, idle, dedupe, urgent repeats, unknown, milestone, byte identity, stale sweep/reset, missing marker\n'
+
+# ---- Approval prompts: claude-notify and codex-permission --------------------------------
+printf 'test\n' > "$TMP/work/.grokbot"
+printf 'milestone build running' > "$TMP/work/.grokbot-status"
+mkdir -p "$TMP/work/sub/dir"
+approve() {   # approve <mode> <json>: waits for the backgrounded ping to finish
+  local before i
+  before=$(grep -c worker-complete "$GROKBOT_HOOKS_DIR/notify.log" || true)
+  printf '%s' "$2" | bash "$REPO/hooks/notify.sh" "$1"
+  for ((i=0; i<300; i++)); do
+    [ "$(grep -c worker-complete "$GROKBOT_HOOKS_DIR/notify.log" || true)" -gt "$before" ] && return
+    sleep 0.02
+  done
+  echo "FAIL: $1 ping did not finish" >&2; exit 1
+}
+before_total=$(wc -l < "$CALLS" | tr -d ' ')
+total() { [ "$(wc -l < "$CALLS" | tr -d ' ')" = "$((before_total + $1))" ] || { echo "FAIL: expected $1 new sends, have $(( $(wc -l < "$CALLS" | tr -d ' ') - before_total ))"; exit 1; }; }
+last() { tail -n 1 "$CALLS" | jq -r "$1"; }
+# Fake transcript whose last tool_use is the command waiting for approval.
+printf '%s\n' '{"type":"user","message":{"content":"hi"}}' \
+  '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"npm publish --dry-run","description":"Publish"}}]}}' \
+  > "$TMP/transcript.jsonl"
+approve claude-notify "$(jq -n --arg cwd "$TMP/work/sub/dir" --arg t "$TMP/transcript.jsonl" \
+  '{cwd:$cwd,session_id:"s1",transcript_path:$t,hook_event_name:"Notification",notification_type:"permission_prompt",message:"Claude needs your permission to use Bash"}')"
+total 1
+[ "$(last .status)" = 'needs_input approval Bash: npm publish --dry-run' ] || { echo "FAIL: claude summary: $(last .status)"; exit 1; }
+[ "$(last .harness)" = claude-notify ] && [ "$(last .session_id)" = s1 ] || { echo 'FAIL: claude identity'; exit 1; }
+[ "$(basename "$(last .worktree)")" = work ] || { echo 'FAIL: parent marker lookup'; exit 1; }
+# No dedupe: the identical prompt pings again. Without a transcript the message is the summary.
+approve claude-notify "$(jq -n --arg cwd "$TMP/work" \
+  '{cwd:$cwd,notification_type:"permission_prompt",message:"Claude needs your permission to use Bash"}')"
+total 2
+[ "$(last .status)" = 'needs_input approval Claude needs your permission to use Bash' ] || { echo "FAIL: message summary: $(last .status)"; exit 1; }
+# Older Claude versions send no notification_type.
+approve claude-notify "$(jq -n --arg cwd "$TMP/work" '{cwd:$cwd,message:"Claude needs your permission to use Edit"}')"
+total 3
+# Not about approval: ignored (idle_prompt, auth_success, legacy idle text).
+for payload in \
+  '{"notification_type":"idle_prompt","message":"Claude is waiting for your input"}' \
+  '{"notification_type":"auth_success","message":"Authenticated"}' \
+  '{"message":"Claude is waiting for your input"}'; do
+  printf '%s' "$payload" | jq --arg cwd "$TMP/work" '. + {cwd:$cwd}' | bash "$REPO/hooks/notify.sh" claude-notify
+done
+sleep 1
+total 3
+# .grokbot-status is never touched.
+[ "$(cat "$TMP/work/.grokbot-status")" = 'milestone build running' ] || { echo 'FAIL: status file changed'; exit 1; }
+# Elicitation counts as input.
+approve claude-notify "$(jq -n --arg cwd "$TMP/work" '{cwd:$cwd,notification_type:"elicitation_dialog",message:"Form open\nline two"}')"
+total 4
+[ "$(last .status)" = 'needs_input approval Form open
+line two' ] && { echo 'FAIL: newline kept'; exit 1; }
+[ "$(last .status)" = 'needs_input approval Form open line two' ] || { echo "FAIL: newline collapse: $(last .status)"; exit 1; }
+# Codex PermissionRequest.
+approve codex-permission "$(jq -n --arg cwd "$TMP/work" \
+  '{cwd:$cwd,session_id:"c1",hook_event_name:"PermissionRequest",tool_name:"Bash",tool_input:{command:"rm -rf build",description:"Remove the build dir"}}')"
+total 5
+[ "$(last .status)" = 'needs_input approval Bash: Remove the build dir' ] || { echo "FAIL: codex summary: $(last .status)"; exit 1; }
+approve codex-permission "$(jq -n --arg cwd "$TMP/work" \
+  '{cwd:$cwd,tool_name:"apply_patch",tool_input:{command:"apply_patch *** Begin Patch"}}')"
+total 6
+[ "$(last .status)" = 'needs_input approval apply_patch: apply_patch *** Begin Patch' ] || { echo "FAIL: codex command: $(last .status)"; exit 1; }
+# Long summaries are cut to 200 bytes.
+approve codex-permission "$(jq -n --arg cwd "$TMP/work" --arg c "$(printf 'x%.0s' {1..500})" '{cwd:$cwd,tool_name:"Bash",tool_input:{command:$c}}')"
+total 7
+[ "$(last '.status | length')" -le 222 ] || { echo 'FAIL: summary not truncated'; exit 1; }
+# A directory with no marker and no map entry sends nothing.
+mkdir "$TMP/other" && git -C "$TMP/other" init -q
+jq -n --arg cwd "$TMP/other" '{cwd:$cwd,tool_name:"Bash",tool_input:{command:"ls"}}' | bash "$REPO/hooks/notify.sh" codex-permission
+sleep 1
+total 7
+grep -q 'codex-permission no-marker' "$GROKBOT_HOOKS_DIR/notify.log" || { echo 'FAIL: no-marker not logged'; exit 1; }
+# A missing marker for a known worktree still pings through the marker map.
+rm "$TMP/work/.grokbot"
+approve codex-permission "$(jq -n --arg cwd "$TMP/work" '{cwd:$cwd,tool_name:"Bash",tool_input:{command:"ls"}}')"
+total 8
+printf 'test\n' > "$TMP/work/.grokbot"
+
+# ---- Sweep stall fallback ------------------------------------------------------------------
+before_total=$(wc -l < "$CALLS" | tr -d ' ')
+export GROKBOT_STALL_MINUTES=45
+ln -s /bin/sleep "$TMP/bin/claude"
+( cd "$TMP/work" && exec "$TMP/bin/claude" 300 </dev/null >/dev/null 2>&1 ) &
+fake_harness=$!
+trap 'kill "$fake_harness" 2>/dev/null; rm -rf "$TMP"' EXIT
+for ((i=0; i<100; i++)); do
+  /usr/sbin/lsof -a -d cwd -Fn -p "$fake_harness" 2>/dev/null | grep -q work && break
+  sleep 0.05
+done
+# The stall age starts at the newer of the status mtime and the last successful ping, so age both.
+backdate() {
+  find "$TMP/work" -exec touch -t 202001010000 {} +
+  for state in "$GROKBOT_STATE_DIR"/*.json; do
+    case "$state" in *.observed.json) continue ;; esac
+    jq '.clock = 1' "$state" > "$state.tmp"; mv "$state.tmp" "$state"
+  done
+}
+slug() { printf '%s' "$(cd "$TMP/work" && pwd -P)" | sed 's/[^A-Za-z0-9]/-/g'; }
+printf 'milestone building the thing' > "$TMP/work/.grokbot-status"
+# Recent activity (just written files): no stall.
+run sweep; total 0
+# Quiet for longer than the threshold: one ping.
+backdate
+run sweep; total 1
+[ "$(last .status)" = 'stalled 45m approval? milestone building the thing' ] || { echo "FAIL: stall status: $(last .status)"; exit 1; }
+[ "$(last .harness)" = sweep ] || { echo 'FAIL: stall harness'; exit 1; }
+# One ping per stall.
+run sweep; total 1
+# Activity ends the stall; a new stall with the same status file pings again.
+touch "$TMP/work/newfile"
+run sweep; total 1
+rm "$TMP/work/newfile"; backdate
+run sweep; total 2
+# A recent session log counts as activity (long builds that write only the log).
+mkdir -p "$HOME/.claude-test/projects/$(slug)"
+touch "$HOME/.claude-test/projects/$(slug)/s.jsonl"
+backdate
+printf 'milestone another status' > "$TMP/work/.grokbot-status"; backdate
+run sweep; total 2
+rm -rf "$HOME/.claude-test"
+run sweep; total 3
+[ "$(last .status)" = 'stalled 45m approval? milestone another status' ] || { echo "FAIL: stall status 2: $(last .status)"; exit 1; }
+# Finished statuses are not stalls, even with an idle harness open.
+for st in 'done PR' 'idle' 'failed x' 'needs_input q'; do
+  printf '%s' "$st" > "$TMP/work/.grokbot-status"; backdate
+  run sweep
+done
+total 3
+# No harness running in the worktree: the plain stalled ping from the stall watchdog, no "approval?".
+kill "$fake_harness"; wait "$fake_harness" 2>/dev/null || true
+printf 'milestone orphan' > "$TMP/work/.grokbot-status"; backdate
+run sweep; total 4
+last .status | grep -q '^stalled [0-9]*m milestone orphan$' || { echo "FAIL: plain stall: $(last .status)"; exit 1; }
+unset GROKBOT_STALL_MINUTES
+
+printf 'PASS: approval pings (Claude Notification, Codex PermissionRequest, filtering, no dedupe), stall sweep, inherited lock on worker death, concurrency, abandoned lock, waiting, idle, dedupe, urgent repeats, unknown, milestone, byte identity, stale sweep/reset, missing marker\n'

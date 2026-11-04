@@ -119,7 +119,23 @@ with tempfile.TemporaryDirectory(prefix='grokbot-http-') as temp:
         assert swept['harness'] == 'sweep'
         assert swept['session_id'] == swept['transcript_path'] == swept['cwd'] == ''
         assert received.empty()
-        print('PASS: local HTTP, T3/Claude/Codex identity, legacy/null fields, dedupe, sweep isolation')
+
+        # Approval pings over real HTTP: always sent, identical repeats included.
+        for mode, payload, expected in [
+                ('claude-notify', dict(cwd=str(work / '.'), hook_event_name='Notification',
+                                       notification_type='permission_prompt',
+                                       message='Claude needs your permission to use Bash'),
+                 'needs_input approval Claude needs your permission to use Bash'),
+                ('codex-permission', dict(cwd=str(work), hook_event_name='PermissionRequest',
+                                          tool_name='Bash', tool_input=dict(command='ls -la')),
+                 'needs_input approval Bash: ls -la')]:
+            for _ in range(2):
+                invoke(mode, payload)
+                body = received.get(timeout=1)
+                assert body['status'] == expected and body['harness'] == mode, body
+                assert body['worktree'] == str(work)
+        assert (work / '.grokbot-status').read_text() == 'waiting new external event'
+        print('PASS: local HTTP, T3/Claude/Codex identity, legacy/null fields, dedupe, sweep isolation, approval pings')
     finally:
         server.shutdown()
         server.server_close()

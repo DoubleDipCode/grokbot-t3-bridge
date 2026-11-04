@@ -19,6 +19,28 @@ is needed.
 }
 ```
 
+To be pinged when Codex is about to ask for approval, add a `PermissionRequest`
+handler next to Stop. It prints no decision, so Codex still shows its normal prompt:
+
+```json
+{
+  "hooks": {
+    "PermissionRequest": [{
+      "hooks": [{
+        "type": "command",
+        "command": "\"/absolute/home/.grokbot-hooks/notify.sh\" codex-permission",
+        "timeout": 15,
+        "statusMessage": "Notifying Grok Bot"
+      }]
+    }]
+  }
+}
+```
+
+Trust it in `/hooks` like the Stop handler. The Codex `notify` setting is not an
+alternative: it only supports `agent-turn-complete`. See
+[Approval-prompt pings](hooks.md#approval-prompt-pings).
+
 Codex also accepts inline `[hooks]` configuration in `config.toml`. Use one form
 per config layer, since sources are combined. The documented feature key is
 `features.hooks`; hooks are enabled by default. Check that your configuration or
