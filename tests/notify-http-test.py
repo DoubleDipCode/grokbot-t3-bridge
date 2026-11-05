@@ -33,11 +33,15 @@ with tempfile.TemporaryDirectory(prefix='grokbot-http-') as temp:
     root = Path(temp).resolve()
     hooks = root / 'hooks'
     hooks.mkdir()
+    (hooks / 'registry-lib.sh').write_text((REPO / 'hooks/registry-lib.sh').read_text())
     home = root / 'home'
     home.mkdir()
     env = dict(os.environ, HOME=str(home), GROKBOT_HOOKS_DIR=str(hooks),
                GROKBOT_STATE_DIR=str(root / 'state'), GROKBOT_STALE_SECONDS='0',
-               NO_PROXY='127.0.0.1', no_proxy='127.0.0.1')
+               NO_PROXY='127.0.0.1', no_proxy='127.0.0.1',
+               GROKBOT_T3_CLI='/nonexistent', GROKBOT_T3_DB_LOOKUP='0')
+    for key in ('T3CODE_THREAD_ID', 'T3CODE_CLI_PATH', 'T3CODE_HOME'):
+        env.pop(key, None)
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

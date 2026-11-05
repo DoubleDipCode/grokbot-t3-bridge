@@ -3,9 +3,11 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+unset T3CODE_THREAD_ID T3CODE_CLI_PATH T3CODE_HOME GROKBOT_T3_CLI GROKBOT_T3_DB GROKBOT_REGISTRY
 export HOME="$TMP/home" GROKBOT_HOOKS_DIR="$TMP/hooks" GROKBOT_STATE_DIR="$TMP/state"
 export GROKBOT_STALE_SECONDS=7200 CALLS="$TMP/calls"
 mkdir -p "$HOME" "$GROKBOT_HOOKS_DIR" "$TMP/bin" "$TMP/work"
+cp "$REPO/hooks/registry-lib.sh" "$GROKBOT_HOOKS_DIR/"
 git -C "$TMP/work" init -q
 printf 'test\n' > "$TMP/work/.grokbot"
 printf 'GROKBOT_WEBHOOK_URL=http://test.invalid\n' > "$GROKBOT_HOOKS_DIR/test.env"

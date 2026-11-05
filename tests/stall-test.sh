@@ -3,9 +3,12 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+unset T3CODE_THREAD_ID T3CODE_CLI_PATH T3CODE_HOME
+export GROKBOT_T3_CLI=/nonexistent GROKBOT_T3_DB_LOOKUP=0   # never reach the real T3
 export GROKBOT_HOOKS_DIR="$TMP/hooks" GROKBOT_STATE_DIR="$TMP/state"
 export CALLS="$TMP/calls" ACTIVE=0
 mkdir -p "$TMP/bin" "$TMP/work/sub" "$GROKBOT_HOOKS_DIR"
+cp "$REPO/hooks/registry-lib.sh" "$GROKBOT_HOOKS_DIR/"
 WORK="$(cd "$TMP/work" && pwd -P)"
 export WORK
 printf 'one\n' > "$WORK/.grokbot"

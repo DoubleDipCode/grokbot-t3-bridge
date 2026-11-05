@@ -53,7 +53,7 @@ The hook only fires when a turn ends. If the harness crashes, the machine sleeps
 
 Give each bot a low-frequency scheduled routine, for example every one or two hours, that:
 
-- lists the T3 threads it launched that are still open,
+- lists the T3 threads it launched that are still open (use the `my_open_threads` from its latest callback payload instead of `t3_thread_list`/`t3_thread_search` where that is recent enough),
 - reads the latest message of any thread that has had no activity for a while,
 - messages you only if something is stuck, and otherwise stays silent.
 

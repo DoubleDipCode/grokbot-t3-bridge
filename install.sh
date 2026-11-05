@@ -16,8 +16,8 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # 1. Copy the scripts.
 mkdir -p "$DEST"
 chmod 700 "$DEST"
-cp "$SRC/hooks/notify.sh" "$SRC/hooks/set-webhook.sh" "$SRC/hooks/config-lib.sh" "$DEST/"
-chmod 700 "$DEST/notify.sh" "$DEST/set-webhook.sh" "$DEST/config-lib.sh"
+cp "$SRC/hooks/notify.sh" "$SRC/hooks/set-webhook.sh" "$SRC/hooks/config-lib.sh" "$SRC/hooks/registry-lib.sh" "$DEST/"
+chmod 700 "$DEST/notify.sh" "$DEST/set-webhook.sh" "$DEST/config-lib.sh" "$DEST/registry-lib.sh"
 echo "Installed scripts to $DEST"
 # The optional local config ($DEST/config) is never created or overwritten here.
 # shellcheck source=hooks/config-lib.sh

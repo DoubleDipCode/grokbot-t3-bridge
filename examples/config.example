@@ -30,3 +30,14 @@
 
 # Directory for dedupe and stall state (default: state/ inside ~/.grokbot-hooks).
 # GROKBOT_STATE_DIR=~/.grokbot-hooks/state
+
+# Thread registry (threads.sqlite). Set to 0 to turn it and the payload thread fields off.
+# GROKBOT_REGISTRY=1
+
+# Lines in the payload's my_open_threads summary (default 8; 0 leaves it empty).
+# GROKBOT_SUMMARY_MAX=8
+
+# The t3 command used to check threads (default: $T3CODE_CLI_PATH, then ~/.t3/bin/t3) and T3's state
+# database for the read-only worktree lookup used for Codex threads. Set the second to 0 to never read it.
+# GROKBOT_T3_CLI=~/.t3/bin/t3
+# GROKBOT_T3_DB_LOOKUP=1
