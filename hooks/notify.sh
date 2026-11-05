@@ -321,8 +321,14 @@ recently_active() {
     [ -d "$d" ] || continue
     [ -n "$(find "$d" -maxdepth 1 -name '*.jsonl' -mmin "-$STALL_MINUTES" -print -quit 2>/dev/null)" ] && return 0
   done
-  local saved
-  saved="$("$JQ" -r '.transcript // empty' "$STATE/$(printf '%s' "$path" | shasum -a 256 | awk '{print $1}').json" 2>/dev/null)"
+  local saved key
+  key="$(printf '%s' "$path" | shasum -a 256 | awk '{print $1}')"
+  # The transcript the turn-start hook saw (a first turn has no Stop ping yet), then the last Stop's.
+  saved="$(head -n1 "$STATE/$key.transcript" 2>/dev/null)"
+  if [ -n "$saved" ] && [ -f "$saved" ] && [ -n "$(find "$saved" -mmin "-$STALL_MINUTES" -print -quit 2>/dev/null)" ]; then
+    return 0
+  fi
+  saved="$("$JQ" -r '.transcript // empty' "$STATE/$key.json" 2>/dev/null)"
   if [ -n "$saved" ] && [ -f "$saved" ] && [ -n "$(find "$saved" -mmin "-$STALL_MINUTES" -print -quit 2>/dev/null)" ]; then
     return 0
   fi
@@ -350,15 +356,15 @@ start_turn() {
 
 # Turn starts seen before the worktree had a .grokbot marker (a thread writes it with its first
 # command, after its first prompt). $STATE/pending/<key> holds: worktree, microseconds, thread id, harness,
-# session id. Once the marker exists the start is adopted as if the hook had seen it; if the turn
+# session id, transcript path. Once the marker exists the start is adopted as if the hook had seen it; if the turn
 # has already ended meanwhile (Stop writes turn_ended) it is just dropped. Unclaimed ones expire.
 adopt_pending() {
-  local f root epoch tid harness session key end cur NOW_P
+  local f root epoch tid harness session transcript key end cur NOW_P
   NOW_P="$(date +%s)"
   [ -d "$STATE/pending" ] || return 0
   for f in "$STATE"/pending/*; do
     [ -f "$f" ] || continue
-    { IFS= read -r root; IFS= read -r epoch; IFS= read -r tid; IFS= read -r harness; IFS= read -r session; } < "$f" || true
+    { IFS= read -r root; IFS= read -r epoch; IFS= read -r tid; IFS= read -r harness; IFS= read -r session; IFS= read -r transcript; } < "$f" || true
     case "$epoch" in *[!0-9]*|'') rm -f "$f"; continue ;; esac
     if [ -n "$root" ] && [ -f "$root/.grokbot" ]; then
       key="$(state_key "$root")"
@@ -369,6 +375,7 @@ adopt_pending() {
       # Only a start newer than everything recorded: a later prompt may have run meanwhile.
       if [ "$end" -lt "$epoch" ] && [ "$cur" -lt "$epoch" ]; then
         write_epoch "$STATE/$key.turn_started" "$epoch"
+        [ -z "$transcript" ] || printf '%s\n' "$transcript" > "$STATE/$key.transcript"
         # A subshell: start_turn sets globals (HARNESS, ROOT, BOT, ...) the caller still needs.
         ( START_US="$epoch"; start_turn "$root" "${harness:-claude-start}" "$session" "$tid" )
       fi
@@ -523,6 +530,7 @@ hook_turn_start() {
   if [ -f "$CURRENT/.grokbot" ]; then
     hook_us
     write_epoch "$STATE/$key.turn_started" "$GROKBOT_HOOK_US" || return 1
+    [ -z "$TRANSCRIPT_PATH" ] || printf '%s\n' "$TRANSCRIPT_PATH" > "$STATE/$key.transcript"
     rm -f "$STATE/pending/$key"
     return 0
   fi
@@ -531,7 +539,7 @@ hook_turn_start() {
   is_t3_worktree "$CURRENT" || return 1
   mkdir -p "$STATE/pending" 2>/dev/null || return 1
   hook_us
-  printf '%s\n%s\n%s\n%s\n%s\n' "$CURRENT" "$GROKBOT_HOOK_US" "$REG_ENV_THREAD" "$HARNESS" "$SESSION_ID" \
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$CURRENT" "$GROKBOT_HOOK_US" "$REG_ENV_THREAD" "$HARNESS" "$SESSION_ID" "$TRANSCRIPT_PATH" \
     > "$STATE/$key.pending.$$" && mv -f "$STATE/$key.pending.$$" "$STATE/pending/$key"
   return 1
 }

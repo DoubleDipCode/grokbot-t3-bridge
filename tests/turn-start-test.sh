@@ -54,7 +54,7 @@ hook() {
   [ -z "${2:-}" ] || printf '%s' "$2" > "$WORK/.grokbot-status"
   touch "$LOGF"
   before=$(grep -c worker-complete "$LOGF" || true)
-  OUT="$(jq -n --arg cwd "$WORK" '{cwd:$cwd,session_id:"sess-1",prompt:"do it"}' | bash "$REPO/hooks/notify.sh" "$mode")"
+  OUT="$(jq -n --arg cwd "$WORK" --arg tr "${TRANSCRIPT:-}" '{cwd:$cwd,session_id:"sess-1",prompt:"do it"} + (if $tr != "" then {transcript_path:$tr} else {} end)' | bash "$REPO/hooks/notify.sh" "$mode")"
   [ -z "$OUT" ] || fail "$mode hook printed to stdout (Claude would inject it as context): $OUT"
   case "${3:-wait}" in nowait) return ;; esac
   for ((i=0; i<300; i++)); do
@@ -265,6 +265,16 @@ hook claude 'done PR'; count 1
 hook claude-start
 age_tree 50; set_epoch turn_ended 90; set_epoch turn_started 50; old_clock
 ACTIVE=1 sweep; count 1
+
+# --- 5d. A first turn (no Stop yet) with a live session transcript is not flagged as quiet. ---
+new_work t5d
+: > "$TMP/session.jsonl"
+TRANSCRIPT="$TMP/session.jsonl" hook claude-start 'in_progress build'
+age_tree 50; set_epoch turn_started 50
+ACTIVE=1 sweep; count 0
+age_file "$TMP/session.jsonl" 50                         # control: the transcript went quiet too
+ACTIVE=1 sweep; count 1
+[ "$(last_status)" = "stalled 45m approval? in_progress build" ] || fail "status: $(last_status)"
 
 # --- 6. Threshold comes from GROKBOT_STALL_MINUTES. ---
 new_work t6
