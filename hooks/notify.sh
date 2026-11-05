@@ -82,6 +82,14 @@ post() {
   [ "$result" -eq 0 ] && [[ "$http" = 2?? ]]
 }
 
+# hook_us: sets GROKBOT_HOOK_US, the time now in microseconds. Turn starts and ends are compared
+# at this resolution, so a start and its Stop in the same second still order correctly.
+hook_us() {
+  GROKBOT_HOOK_US="$(perl -MTime::HiRes=time -e 'printf "%d", time * 1000000' 2>/dev/null)"
+  case "$GROKBOT_HOOK_US" in *[!0-9]*|'') GROKBOT_HOOK_US="$(date +%s)000000" ;; esac
+  export GROKBOT_HOOK_US
+}
+
 # write_epoch <file> <number>: atomic one-line write.
 write_epoch() {
   printf '%s\n' "$2" > "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"
@@ -91,18 +99,17 @@ state_key() {
   printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
 }
 
-# Turn bookkeeping, one pair of files per worktree in $STATE (epoch seconds):
+# Turn bookkeeping, one pair of files per worktree in $STATE (epoch microseconds):
 #   <key>.turn_started  written by the turn-start hook (UserPromptSubmit)
 #   <key>.turn_ended    written by the Stop hook
-# A turn is open when it started at or after the last end (ties count as open: a queued message can
-# start in the same second the previous turn ended). turn_open <key> sets TURN_START.
+# A turn is open when it started after the last end. turn_open <key> sets TURN_START.
 turn_open() {
   local s e
   s="$(cat "$STATE/$1.turn_started" 2>/dev/null)"
   e="$(cat "$STATE/$1.turn_ended" 2>/dev/null)"
   case "$s" in *[!0-9]*|'') return 1 ;; esac
   case "$e" in *[!0-9]*|'') e=0 ;; esac
-  [ "$s" -ge "$e" ] || return 1
+  [ "$s" -gt "$e" ] || return 1
   TURN_START="$s"
 }
 
@@ -184,7 +191,7 @@ WORD="$(printf '%s' "$STATUS" | awk 'NR==1 {print $1}')"
 if [ "$HARNESS" = sweep ]; then
   registry_record sweep
 else
-  START_BEFORE="${GROKBOT_HOOK_EPOCH:-}"
+  EVENT_US="${GROKBOT_HOOK_US:-}"
   registry_record turn
   registry_resolve "$ROOT" "$REG_ENV_THREAD"
 fi
@@ -217,7 +224,7 @@ if [ "$HARNESS" = sweep ] && [ -f "$ROOT/.grokbot" ] && turn_open "$KEY"; then
   # Once per dead turn, however the status file changes afterwards.
   [ "$(cat "$STATE/$KEY.turndead" 2>/dev/null)" != "$TURN_START" ] || return 0
   # Quiet since the later of the turn start and the last status write.
-  LIVE="$(perl -e 'my $m = (stat($ARGV[0]))[9] || 0; print $m > $ARGV[1] ? $m : $ARGV[1]' "$ROOT/.grokbot-status" "$TURN_START")"
+  LIVE="$(perl -e 'my $m = (stat($ARGV[0]))[9] || 0; print $m > $ARGV[1] ? $m : $ARGV[1]' "$ROOT/.grokbot-status" "$((TURN_START / 1000000))")"
   AGE=$((NOW - LIVE))
   [ "$AGE" -ge "$((STALL_MINUTES * 60))" ] || return 0
   harness_running "$ROOT"
@@ -323,7 +330,7 @@ recently_active() {
 }
 
 # Turn start (claude-start, codex-start). Runs under the sweep lock: marker map, thread registry.
-# Needs START_EPOCH, the time the hook fired. Sends nothing.
+# Needs START_US, the time the hook fired in microseconds. Sends nothing.
 start_turn() {
   ROOT="$1"
   HARNESS="$2"
@@ -336,12 +343,13 @@ start_turn() {
   ensure_marker "$ROOT" "$BOT"
   STATUS=running
   WORD=running
+  EVENT_US="${START_US:-}"
   registry_record start
   registry_resolve "$ROOT" "${4:-}"
 }
 
 # Turn starts seen before the worktree had a .grokbot marker (a thread writes it with its first
-# command, after its first prompt). $STATE/pending/<key> holds: worktree, epoch, thread id, harness,
+# command, after its first prompt). $STATE/pending/<key> holds: worktree, microseconds, thread id, harness,
 # session id. Once the marker exists the start is adopted as if the hook had seen it; if the turn
 # has already ended meanwhile (Stop writes turn_ended) it is just dropped. Unclaimed ones expire.
 adopt_pending() {
@@ -358,11 +366,11 @@ adopt_pending() {
       case "$end" in *[!0-9]*|'') end=0 ;; esac
       if [ "$end" -lt "$epoch" ]; then
         write_epoch "$STATE/$key.turn_started" "$epoch"
-        START_EPOCH="$epoch"
-        start_turn "$root" "${harness:-claude-start}" "$session" "$tid"
+        # A subshell: start_turn sets globals (HARNESS, ROOT, BOT, ...) the caller still needs.
+        ( START_US="$epoch"; start_turn "$root" "${harness:-claude-start}" "$session" "$tid" )
       fi
       rm -f "$f"
-    elif [ ! -d "$root" ] || [ "$((NOW_P - epoch))" -gt 86400 ]; then
+    elif [ ! -d "$root" ] || [ "$((NOW_P - epoch / 1000000))" -gt 86400 ]; then
       rm -f "$f"
     fi
   done
@@ -382,7 +390,7 @@ worker() {
   case "$mode" in
     claude-start|codex-start)
       # Bookkeeping only: no sweep, no registry upkeep, so a prompt never waits on more than this.
-      START_EPOCH="${GROKBOT_HOOK_EPOCH:-}"
+      START_US="${GROKBOT_HOOK_US:-}"
       start_turn "$CURRENT" "$mode" "$SESSION_ID" "$REG_ENV_THREAD"
       echo "$(date '+%Y-%m-%dT%H:%M:%S%z') worker-complete" >> "$LOG"
       return 0 ;;
@@ -510,7 +518,8 @@ hook_turn_start() {
   mkdir -p "$STATE" 2>/dev/null || return 1
   key="$(state_key "$CURRENT")"
   if [ -f "$CURRENT/.grokbot" ]; then
-    write_epoch "$STATE/$key.turn_started" "$GROKBOT_HOOK_EPOCH" || return 1
+    hook_us
+    write_epoch "$STATE/$key.turn_started" "$GROKBOT_HOOK_US" || return 1
     rm -f "$STATE/pending/$key"
     return 0
   fi
@@ -518,7 +527,8 @@ hook_turn_start() {
   # remember the start for T3 worktrees only; the next sweep adopts it once the marker exists.
   is_t3_worktree "$CURRENT" || return 1
   mkdir -p "$STATE/pending" 2>/dev/null || return 1
-  printf '%s\n%s\n%s\n%s\n%s\n' "$CURRENT" "$GROKBOT_HOOK_EPOCH" "$REG_ENV_THREAD" "$HARNESS" "$SESSION_ID" \
+  hook_us
+  printf '%s\n%s\n%s\n%s\n%s\n' "$CURRENT" "$GROKBOT_HOOK_US" "$REG_ENV_THREAD" "$HARNESS" "$SESSION_ID" \
     > "$STATE/$key.pending.$$" && mv -f "$STATE/$key.pending.$$" "$STATE/pending/$key"
   return 1
 }
@@ -528,7 +538,7 @@ hook_turn_end() {
   [ -f "$CURRENT/.grokbot" ] || [ -d "$STATE/pending" ] || return 0
   mkdir -p "$STATE" 2>/dev/null || return 0
   key="$(state_key "$CURRENT")"
-  [ ! -f "$CURRENT/.grokbot" ] || write_epoch "$STATE/$key.turn_ended" "$GROKBOT_HOOK_EPOCH"
+  [ ! -f "$CURRENT/.grokbot" ] || { hook_us; write_epoch "$STATE/$key.turn_ended" "$GROKBOT_HOOK_US"; }
   rm -f "$STATE/pending/$key"
 }
 
@@ -551,8 +561,6 @@ if [ "$HARNESS" != --sweep ]; then
   esac
   CURRENT="$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null || echo "$CWD")"
   MESSAGE="$(printf '%s' "$INPUT" | "$JQ" -r '.last_assistant_message // empty' 2>/dev/null | head -c 1500)"
-  GROKBOT_HOOK_EPOCH="$(date +%s)"
-  export GROKBOT_HOOK_EPOCH
   case "$HARNESS" in
     claude-start|codex-start) hook_turn_start || exit 0 ;;
     *) hook_turn_end ;;

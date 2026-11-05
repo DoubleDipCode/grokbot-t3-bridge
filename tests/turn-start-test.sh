@@ -66,7 +66,14 @@ hook() {
 sweep() { bash "$REPO/hooks/notify.sh" --sweep; }
 count() { [ "$(wc -l < "$CALLS" | tr -d ' ')" = "$1" ] || fail "expected $1 sends, got $(wc -l < "$CALLS" | tr -d ' ')"; }
 # Move a state timestamp or a file mtime into the past (minutes ago).
-set_epoch() { printf '%s\n' "$(( $(now) - $2 * 60 ))" > "$GROKBOT_STATE_DIR/$KEY.$1"; }
+set_epoch() { printf '%s\n' "$(( ($(now) - $2 * 60) * 1000000 ))" > "$GROKBOT_STATE_DIR/$KEY.$1"; }
+# Move both turn files back in time together, keeping their order.
+shift_turns() {
+  local f
+  for f in turn_started turn_ended; do
+    [ ! -f "$GROKBOT_STATE_DIR/$KEY.$f" ] || printf '%s\n' "$(( $(cat "$GROKBOT_STATE_DIR/$KEY.$f") - $1 * 60000000 ))" > "$GROKBOT_STATE_DIR/$KEY.$f"
+  done
+}
 # The Stop ping stores a delivery clock the existing stall rule also honours: age it too.
 old_clock() {
   local f="$GROKBOT_STATE_DIR/$KEY.json"
@@ -87,7 +94,7 @@ grep -q "^$WORK	one$" "$GROKBOT_HOOKS_DIR/markers.tsv" || fail 'worktree not in 
 [ "$(row status_word)" = running ] || fail "registry status: $(row status_word)"
 [ "$(row thread_id)" = thread-1a ] || fail "registry thread id: $(row thread_id)"
 [ "$(row harness)" = claude ] || fail "registry harness: $(row harness)"
-[ "$(row started_at)" = "$(cat "$GROKBOT_STATE_DIR/$KEY.turn_started")" ] || fail 'registry started_at'
+[ "$(row started_at)" = "$(( $(cat "$GROKBOT_STATE_DIR/$KEY.turn_started") / 1000000 ))" ] || fail 'registry started_at'
 count 0
 sweep; count 0                          # fresh turn: not stalled yet
 [ "$(row status_word)" = running ] || fail 'sweep overwrote running with the stale status'
@@ -185,6 +192,43 @@ hook claude 'done PR'; count 1
 set_epoch turn_started 99; set_epoch turn_ended 98
 age_tree 98
 sweep; count 1                                           # the turn ended: nothing to report
+
+# --- 4c. A turn that starts and ends within the same second is closed, not dead. ---
+new_work t4c
+hook claude-start
+hook claude 'done quick'; count 1
+shift_turns 100; age_tree 100
+sweep; count 1
+[ "$(cat "$GROKBOT_STATE_DIR/$KEY.turn_started")" -lt "$(cat "$GROKBOT_STATE_DIR/$KEY.turn_ended")" ] || fail 'Stop not ordered after start'
+
+# --- 4d. Late workers do not overwrite the row of a newer start or end. ---
+new_work t4d
+hook claude-start
+# shellcheck disable=SC2034 # the library reads these globals
+ev() { # ev <mode> <word> <us>: a registry write as a delayed worker would do it
+  ( set +eu; DIR="$GROKBOT_HOOKS_DIR"; STATE="$GROKBOT_STATE_DIR"; LOG="$LOGF"; MAP="$DIR/markers.tsv"; JQ=jq
+    . "$REPO/hooks/registry-lib.sh"
+    ROOT="$WORK" BOT=one HARNESS=claude SESSION='' LAST='' STATUS="$2" WORD="$2" TS=t EVENT_US="$3"
+    registry_record "$1" )
+}
+ev turn 'done' 5                                           # an old Stop arrives after the newer start
+[ "$(row status_word)" = running ] && [ -n "$(row started_at)" ] || fail 'late Stop overwrote a newer start'
+ev turn 'done' 99999999999999999
+[ "$(row status_word)" = "done" ] && [ -z "$(row started_at)" ] || fail 'Stop did not apply'
+ev start running 6                                       # an old start arrives after the newer Stop
+[ "$(row status_word)" = "done" ] && [ -z "$(row started_at)" ] || fail 'late start overwrote a newer Stop'
+
+# --- 4e. Adopting another worktree's pending start leaves the current hook's harness alone. ---
+new_work t4e
+mkdir -p "$TMP/other"; OTHER="$(cd "$TMP/other" && pwd -P)"
+OKEY="$(printf '%s' "$OTHER" | shasum -a 256 | awk '{print $1}')"
+mkdir -p "$GROKBOT_STATE_DIR/pending"
+printf '%s\n%s\n%s\n%s\n%s\n' "$OTHER" "$(( $(now) * 1000000 ))" thread-o claude-start sess-o > "$GROKBOT_STATE_DIR/pending/$OKEY"
+printf 'one\n' > "$OTHER/.grokbot"
+hook codex 'done PR'
+jq -e 'select(.harness == "codex" and .worktree == "'"$WORK"'")' "$CALLS" >/dev/null || fail "payload harness clobbered: $(cat "$CALLS")"
+[ "$(row harness)" = codex ] || fail "row harness: $(row harness)"
+[ "$(sqlite3 -batch "$GROKBOT_HOOKS_DIR/threads.sqlite" "SELECT harness||status_word FROM threads WHERE worktree='$OTHER'")" = claude-startrunning ] || [ "$(sqlite3 -batch "$GROKBOT_HOOKS_DIR/threads.sqlite" "SELECT harness||status_word FROM threads WHERE worktree='$OTHER'")" = clauderunning ] || fail 'other worktree not adopted'
 
 # --- 5. Harness alive and quiet: the approval? rule is unchanged. ---
 new_work t5
