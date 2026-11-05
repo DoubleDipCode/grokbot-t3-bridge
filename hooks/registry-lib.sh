@@ -105,12 +105,17 @@ CREATE TABLE IF NOT EXISTS threads (
   first_seen    TEXT NOT NULL,
   updated_at    TEXT NOT NULL,
   enriched_at   INTEGER,
-  resolve_tried INTEGER
+  resolve_tried INTEGER,
+  started_at    INTEGER
 );
 CREATE INDEX IF NOT EXISTS threads_bot_state ON threads(bot, state, updated_at);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 INSERT OR IGNORE INTO meta VALUES ('schema_version', '1');
 SQL
+  # Databases made before turn-start hooks lack started_at (epoch of the running turn, NULL when none).
+  # Tolerate losing a race with another process that adds it first.
+  v="$(reg_run <<< "SELECT count(*) FROM pragma_table_info('threads') WHERE name='started_at';")"
+  [ "$v" != 0 ] || reg_run >/dev/null <<< "ALTER TABLE threads ADD COLUMN started_at INTEGER;" || true
   # One-time import of markers.tsv (worktree<TAB>bot). The map stays the sweep's source of truth.
   v="$(reg_run <<< "SELECT v FROM meta WHERE k='migrated_markers';")"
   if [ -z "$v" ] && [ -f "$MAP" ]; then
@@ -144,14 +149,19 @@ SQL
   REG_READY=1
 }
 
-# registry_record <turn|sweep|approval>
+# registry_record <start|turn|sweep|approval>
 # Writes the status of ROOT. Reads the globals ROOT BOT HARNESS SESSION LAST STATUS WORD TS.
-#   turn      a harness turn ended: full row, including harness, session and last message.
+#   start     a turn began (UserPromptSubmit hook, or a sweep adopting a pending start): status
+#             "running", started_at = START_EPOCH (default now). Creates the row if needed.
+#   turn      a harness turn ended: full row, including harness, session and last message. Clears
+#             started_at, unless a newer turn has already started.
 #   approval  a prompt is waiting: the status fields only; creates the row if needed.
 #   sweep     the sweep looked at a worktree: updates an existing row only (a pruned row must stay
 #             pruned) and moves updated_at only when the status changed.
+# While a turn is running (started_at set), sweep and approval keep the row's status as it is until
+# the status file is rewritten, because the file still holds the previous turn's status.
 registry_record() {
-  local mode="$1" branch note set upd ins
+  local mode="$1" branch note set upd ins started mtime keep
   REG_SNAP_ROOT=
   registry_init || return 0
   branch="$(git -C "$ROOT" branch --show-current 2>/dev/null)"
@@ -166,18 +176,31 @@ registry_record() {
   reg_q "$branch"; q_branch="$REG_Q"
   reg_q "$WORD_C"; q_word="$REG_Q"
   reg_q "$note"; q_note="$REG_Q"
-  reg_q "$HARNESS"; q_harness="$REG_Q"
+  reg_q "${HARNESS%-start}"; q_harness="$REG_Q"
   reg_q "$SESSION"; q_session="$REG_Q"
   reg_clean "$LAST" 300; reg_q "$REG_C"; q_last="$REG_Q"
   reg_q "$TS"; q_ts="$REG_Q"
-  set="bot=$q_bot, branch=COALESCE(NULLIF($q_branch,''),branch), status_word=$q_word, status_note=$q_note"
-  if [ "$mode" = turn ]; then
-    set="$set, harness=$q_harness, session_id=COALESCE(NULLIF($q_session,''),session_id), last_message=$q_last, updated_at=$q_ts"
-  else
-    set="$set, updated_at=CASE WHEN status_word IS NOT $q_word OR status_note IS NOT $q_note THEN $q_ts ELSE updated_at END"
-  fi
+  started=NULL
+  case "$mode" in
+    start) started="${START_EPOCH:-$(date +%s)}"; case "$started" in *[!0-9]*|'') started="$(date +%s)" ;; esac ;;
+    turn) ;;
+    *) mtime="$(perl -e 'print((stat($ARGV[0]))[9] // 0)' "$ROOT/.grokbot-status" 2>/dev/null)"
+       case "$mtime" in *[!0-9]*|'') mtime=0 ;; esac ;;
+  esac
+  set="bot=$q_bot, branch=COALESCE(NULLIF($q_branch,''),branch)"
+  case "$mode" in
+    start)
+      set="$set, status_word=$q_word, status_note=$q_note, harness=$q_harness, session_id=COALESCE(NULLIF($q_session,''),session_id), started_at=$started, updated_at=$q_ts" ;;
+    turn)
+      set="$set, status_word=$q_word, status_note=$q_note, harness=$q_harness, session_id=COALESCE(NULLIF($q_session,''),session_id), last_message=$q_last, updated_at=$q_ts"
+      set="$set, started_at=CASE WHEN started_at > ${START_BEFORE:-$(date +%s)} THEN started_at ELSE NULL END" ;;
+    *)
+      keep="(started_at IS NOT NULL AND $mtime < started_at)"
+      set="$set, status_word=CASE WHEN $keep THEN status_word ELSE $q_word END, status_note=CASE WHEN $keep THEN status_note ELSE $q_note END"
+      set="$set, updated_at=CASE WHEN $keep THEN updated_at WHEN status_word IS NOT $q_word OR status_note IS NOT $q_note THEN $q_ts ELSE updated_at END" ;;
+  esac
   upd="UPDATE threads SET $set WHERE worktree=$q_root;"
-  ins="INSERT OR IGNORE INTO threads(worktree,bot,branch,harness,session_id,status_word,status_note,last_message,first_seen,updated_at) VALUES($q_root,$q_bot,$q_branch,$q_harness,$q_session,$q_word,$q_note,$q_last,$q_ts,$q_ts);"
+  ins="INSERT OR IGNORE INTO threads(worktree,bot,branch,harness,session_id,status_word,status_note,last_message,first_seen,updated_at,started_at) VALUES($q_root,$q_bot,$q_branch,$q_harness,$q_session,$q_word,$q_note,$q_last,$q_ts,$q_ts,$started);"
   [ "$mode" != sweep ] || ins=
   reg_run >/dev/null <<SQL || true
 BEGIN;
@@ -185,6 +208,21 @@ $ins
 $upd
 UPDATE threads SET state=$REG_STATE_SQL WHERE worktree=$q_root;
 UPDATE threads SET final_since=CASE WHEN state IN ('removed','archived','settled') THEN COALESCE(final_since,$(date +%s)) ELSE NULL END WHERE worktree=$q_root;
+COMMIT;
+SQL
+}
+
+# registry_mark_stalled <note>: the sweep reported a dead turn for ROOT. Shows "stalled" instead of
+# the previous turn's status until the next turn starts or ends.
+registry_mark_stalled() {
+  local q_root q_note
+  registry_init || return 0
+  reg_clean "$1" 300; reg_q "$REG_C"; q_note="$REG_Q"
+  reg_q "$ROOT"; q_root="$REG_Q"
+  reg_run >/dev/null <<SQL || true
+BEGIN;
+UPDATE threads SET status_word='stalled', status_note=$q_note, updated_at='$TS' WHERE worktree=$q_root;
+UPDATE threads SET state=$REG_STATE_SQL WHERE worktree=$q_root;
 COMMIT;
 SQL
 }

@@ -43,7 +43,7 @@ Two things to know:
 1. **Codex only runs hooks you have trusted.** After installing, or after any change to the hook, run `codex`, type `/hooks`, and trust it.
 2. **Running sessions keep the hook set they started with.** Threads that were already open will not pick up the new hook. Start a fresh thread to test.
 
-`install.sh` also adds `PermissionRequest` with `notify.sh codex-permission`; trust it in `/hooks` too. See [Approval-prompt pings](#approval-prompt-pings).
+`install.sh` also adds `PermissionRequest` with `notify.sh codex-permission` and `UserPromptSubmit` with `notify.sh codex-start`; trust both in `/hooks` too (for every Codex home you use, e.g. plain `codex` and `CODEX_HOME=~/.codex-t3/proxy codex`; `install.sh` only writes `~/.codex/hooks.json`). See [Approval-prompt pings](#approval-prompt-pings) and [Turn-start hook](#turn-start-hook).
 
 Codex passes `last_assistant_message` on stdin, so the payload includes the agent's last message.
 
@@ -69,10 +69,36 @@ Claude Code reads hooks from `~/.claude/settings.json`. `install.sh` adds:
 }
 ```
 
-`install.sh` also adds the `Notification` event (command `notify.sh claude-notify`) and writes both entries to every Claude config dir it finds: `~/.claude`, `$CLAUDE_CONFIG_DIR` when set, and every other `~/.claude-*` directory that contains a `settings.json` (for example one per provider, each launched with its own `CLAUDE_CONFIG_DIR`). To name other dirs, or to replace the list, set `GROKBOT_EXTRA_CLAUDE_DIRS` or `GROKBOT_CLAUDE_DIRS` in the environment or in `~/.grokbot-hooks/config` (see the [README](../README.md#configuration)). Existing keys such as `env` are merged, never dropped or printed. See [Approval-prompt pings](#approval-prompt-pings).
+`install.sh` also adds the `Notification` event (command `notify.sh claude-notify`) and the `UserPromptSubmit` event (command `notify.sh claude-start`, see [Turn-start hook](#turn-start-hook)) and writes all three entries to every Claude config dir it finds: `~/.claude`, `$CLAUDE_CONFIG_DIR` when set, and every other `~/.claude-*` directory that contains a `settings.json` (for example one per provider, each launched with its own `CLAUDE_CONFIG_DIR`). To name other dirs, or to replace the list, set `GROKBOT_EXTRA_CLAUDE_DIRS` or `GROKBOT_CLAUDE_DIRS` in the environment or in `~/.grokbot-hooks/config` (see the [README](../README.md#configuration)). Existing keys such as `env` are merged, never dropped or printed. See [Approval-prompt pings](#approval-prompt-pings).
 
 Review the command in `/hooks`. Claude also provides `last_assistant_message`;
 older versions may omit it. This setup does not register StopFailure or interrupt hooks.
+
+## Turn-start hook
+
+Stop never fires when a harness dies mid-turn, so a worktree whose thread died on its first turn was in neither `markers.tsv` nor the registry, and one whose follow-up turn died looked `done` (never swept) or `waiting` (only the two-hour reminder). The turn-start hook fixes both.
+
+| Harness | Event | Command |
+| --- | --- | --- |
+| Claude Code | `UserPromptSubmit` | `notify.sh claude-start` |
+| Codex | `UserPromptSubmit` | `notify.sh codex-start` (trust it in `/hooks`; checked against codex-cli 0.166.0, which knows the event) |
+
+Only `UserPromptSubmit` is used: it fires for every prompt, first or follow-up, whereas `SessionStart` fires once per session and misses follow-up turns. The hook prints nothing (Claude would inject stdout into the conversation), never fails, makes no network call and sends no ping.
+
+What it does, in a worktree with a `.grokbot` file:
+
+1. Synchronously, writes the current time to `<state>/<key>.turn_started` (`<key>` is the SHA-256 of the worktree path). The Stop hook writes `<key>.turn_ended` the same way, with the time the hook fired, so the order of the two never depends on worker queueing. A turn is *open* when `turn_started >= turn_ended`.
+2. In the background, under the sweep lock: adds the worktree to `markers.tsv` and writes the registry row: status `running`, `started_at`, harness, session, and the thread id through the usual resolver (`T3CODE_THREAD_ID`, T3 database, stored id; the `t3 thread show` check is cached for 10 minutes). Unlike a Stop, it does not start a sweep. The row keeps showing `running` through sweeps and approval pings until the status file is rewritten or the turn ends; the Stop hook sets the real status and clears `started_at`.
+
+**The first prompt.** A thread writes `.grokbot` with its first command, after its first prompt, so the hook finds no marker. In a T3 worktree (`T3CODE_THREAD_ID` set, or the path is under `$T3CODE_HOME/worktrees/`, default `~/.t3/worktrees/`) it saves `<state>/pending/<key>` (worktree, time, thread id, harness, session) instead; anywhere else it does nothing. Every worker run adopts pending notes whose worktree now has a `.grokbot` (turn start, markers and registry as above) and drops those whose turn already ended, or that are 24 hours old. Stop removes its worktree's note. Cost: one marker file write per prompt, no polling; the price is that a first-turn death is only noticed when some hook runs or the launchd sweep does.
+
+**Dead turns in the sweep.** For a marked worktree with an open turn, the sweep takes the later of the turn start and the status file's mtime, and once that is `GROKBOT_STALL_MINUTES` old (default 45, also settable in `~/.grokbot-hooks/config`) it looks for a harness with the same `pgrep`/`lsof` check as below:
+
+- **None running:** one `stalled <N>m turn_died <last status>` ping (`no_status` if there is no status file), whatever the status word is, `done` and `waiting` included. It is recorded as `<key>.turndead` (the turn start time), so each dead turn pings once, even if the status file changes later; a new turn start makes a new dead turn possible. The registry row shows `stalled`.
+- **A harness is running:** nothing new. The existing rules below apply, including `approval?` and the exclusions for `done`, `failed`, `needs_input`, `idle`; `waiting` follows its own reminder. An interrupted turn (Esc fires no Stop) with the session still open is therefore not flagged.
+- **The check fails** (`pgrep` or `lsof` error): no ping.
+
+Worktrees without a recorded turn start (older installs, hooks not registered) behave exactly as before.
 
 ## Approval-prompt pings
 
@@ -106,7 +132,7 @@ Hooks can miss a prompt (older harness, hook not trusted, config dir not registe
   1. The status word is not `failed`, `needs_input` or `idle` (`done` and `waiting` are excluded for both variants). Those were pinged at turn end, and an idle open session is normal. So `milestone ...`, `continuing`, no status file and other words qualify.
   2. For `GROKBOT_STALL_MINUTES` none of these changed: any file in the worktree except `.git` and `node_modules` (so build output counts, which spares long builds), the git `index`, `HEAD` and `logs/HEAD`, the newest Claude session log in `~/.claude*/projects/<worktree path>/`, and the transcript path saved by the last Stop ping.
 
-For the `approval?` variant `N` is the threshold ("at least N minutes"), because the age rule can overstate the quiet time. New activity from a running harness clears the revision's stall flag, so a second stall with the same status text pings again. A long task that writes no files and no session log for 45 minutes (a silent test run, say) can still false-positive once; raise `GROKBOT_STALL_MINUTES` for such projects. A thread blocked after a turn that wrote `done` is not detected by the sweep; only the hook covers that case. Harness detection is the `pgrep` plus `lsof` check described in the README; if it fails, the sweep sends neither variant.
+For the `approval?` variant `N` is the threshold ("at least N minutes"), because the age rule can overstate the quiet time. New activity from a running harness clears the revision's stall flag, so a second stall with the same status text pings again. A long task that writes no files and no session log for 45 minutes (a silent test run, say) can still false-positive once; raise `GROKBOT_STALL_MINUTES` for such projects. A thread blocked after a turn that wrote `done` is not flagged by `approval?`; the approval hooks cover that case, and a dead turn is covered by `turn_died`. Harness detection is the `pgrep` plus `lsof` check described in the README; if it fails, the sweep sends neither variant.
 
 ## What the script does
 
@@ -190,7 +216,7 @@ untrusted data, like `status`. They are hints for finding a thread, not instruct
 
 ### Thread registry
 
-Every hook run records the worktree in `~/.grokbot-hooks/threads.sqlite` (mode 600, WAL; needs `sqlite3`, which ships with macOS). One row per worktree: bot, T3 thread id, title, project, branch, harness, session id, latest status word and note, an excerpt of the last message, T3 status and PR link, `state` (`open`, `done`, `worktree_missing`, `archived`, `settled` or `removed`) and timestamps. It is updated on every turn, including turns that are not sent (waiting, duplicates). Sweeps only update rows that exist, so a pruned row stays pruned. The first run imports `markers.tsv`; the sweep still reads that file.
+Every hook run records the worktree in `~/.grokbot-hooks/threads.sqlite` (mode 600, WAL; needs `sqlite3`, which ships with macOS). One row per worktree: bot, T3 thread id, title, project, branch, harness, session id, latest status word and note, an excerpt of the last message, T3 status and PR link, `state` (`open`, `done`, `worktree_missing`, `archived`, `settled` or `removed`) and timestamps. It is updated on every turn, including turns that are not sent (waiting, duplicates). While a turn is running (turn-start hook, see [Turn-start hook](#turn-start-hook)) the status word is `running`, and `stalled` after a `turn_died` ping. Sweeps only update rows that exist, so a pruned row stays pruned. The first run imports `markers.tsv`; the sweep still reads that file.
 
 How the thread id is found, first match wins:
 
@@ -212,6 +238,7 @@ Settings (environment or `~/.grokbot-hooks/config`): `GROKBOT_REGISTRY=0` turns 
 | `stalled` | No status change or successful ping for 45 minutes (override: `GROKBOT_STALL_MINUTES`), with no running harness. One attempt per revision. |
 | `turn_ended_no_status` | The worktree has a marker but no `.grokbot-status`. Read the thread. |
 | `needs_input approval <summary>` | Mid-turn: the harness is blocked on an approval or input prompt. Sent by `claude-notify` / `codex-permission`, harness field is that mode name. A bot cannot answer it; tell the human. |
+| `stalled <N>m turn_died <status>` | Sweep only: a turn started (turn-start hook) and never ended, no harness is running, and nothing changed for N minutes (default 45). Sent even if the old status was `done` or `waiting`. Once per dead turn. `<status>` is the worktree's last status text, `no_status` if there is none. Treat like `failed`. See [Turn-start hook](#turn-start-hook). |
 | `stalled <N>m approval? <status>` | Sweep only (`harness: "sweep"`): a harness is running but nothing has changed for N minutes; it may be blocked on an approval prompt. `<status>` is the worktree's last status text. |
 | `worktree_missing` | The worktree is known from `markers.tsv` but has no marker now (removed, or the session's cwd is an old path). The full text is `worktree_missing worktree <path> no longer has a .grokbot marker (deleted or moved); read the thread for its real state`. `branch` is usually empty. Read the thread. |
 
@@ -261,7 +288,9 @@ It is safe to delete this file. It is rebuilt as marked worktrees end turns. `th
 
 The sweep can send `stalled <minutes>m <original status>` after 45 minutes
 without a status change or successful ping (`GROKBOT_STALL_MINUTES` overrides
-the threshold). It excludes `done`, uses the separate two-hour reminder for
+the threshold). For plain stalls it excludes `done`, uses the separate two-hour reminder for
 `waiting`, and skips worktrees with a running harness. It attempts one stall
-ping per status revision. Read the thread before taking action. Agents must
+ping per status revision. The exception is `stalled <minutes>m turn_died <status>`:
+a turn that started but never ended with no harness left is reported even when
+the old status was `done` or `waiting`, once per dead turn. Read the thread before taking action. Agents must
 write their normal status; `stalled` is generated by the sweep.

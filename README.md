@@ -92,7 +92,7 @@ ONE-SHOT-PROMPT.md        paste-in prompt for building your own version from scr
 install.sh                installs the hooks for Codex and every Claude config dir (idempotent)
 uninstall.sh              removes the hook entries again
 hooks/config-lib.sh       shared parser for the optional config file and Claude dir detection
-hooks/notify.sh           Stop hook, approval-prompt pings and sweep: reads marker + status, POSTs to the bot
+hooks/notify.sh           Stop hook, turn-start hook, approval-prompt pings and sweep: reads marker + status, POSTs to the bot
 hooks/registry-lib.sh     thread registry (threads.sqlite): finds the T3 thread for each worktree, builds my_open_threads
 hooks/set-webhook.sh      stores one bot's webhook URL + auth in a chmod 600 file
 examples/config.example   optional local config (copy to ~/.grokbot-hooks/config)
@@ -124,9 +124,15 @@ A thread blocked on a permission prompt has not ended its turn, so Stop never fi
 - **Claude Code:** the `Notification` event (`notify.sh claude-notify`), for permission and input prompts. Other notification types are ignored.
 - **Codex:** the `PermissionRequest` event (`notify.sh codex-permission`). Trust it once in `codex` under `/hooks`, like the Stop hook. Codex's `notify` setting cannot do this: it only supports `agent-turn-complete`.
 
-`install.sh` registers them: `Notification` in every Claude config dir it finds (see [Configuration](#configuration)) and `PermissionRequest` in `~/.codex/hooks.json`. These pings always send (no dedupe) and never touch `.grokbot-status`. A bot cannot answer the prompt; it should tell the human.
+`install.sh` registers them: `Notification` in every Claude config dir it finds (see [Configuration](#configuration)) and `PermissionRequest` in `~/.codex/hooks.json`. It also registers the `UserPromptSubmit` turn-start hooks for [dead turns](#dead-turns); like every Codex hook, the Codex one must be trusted in `/hooks`. These pings always send (no dedupe) and never touch `.grokbot-status`. A bot cannot answer the prompt; it should tell the human.
 
 As a fallback, the sweep sends `stalled <N>m approval? <status>` when a harness is running in a marked worktree but nothing has changed for `GROKBOT_STALL_MINUTES` (default 45). Details: [docs/hooks.md](docs/hooks.md#approval-prompt-pings).
+
+## Dead turns
+
+A harness that dies mid-turn (crash, killed, machine slept, quota error) never fires Stop, so a turn-start hook records when each turn begins: Claude Code `UserPromptSubmit` (`notify.sh claude-start`) and Codex `UserPromptSubmit` (`notify.sh codex-start`). It sends nothing and prints nothing. In a marked worktree it adds the worktree to `markers.tsv`, writes the thread's registry row (status `running`, `started_at`, thread id through the usual resolver) and stores a `turn_started` time in the state dir; Stop stores `turn_ended`. The sweep reports a turn that started at or after its last end, has had no status write for `GROKBOT_STALL_MINUTES` (default 45) and has no harness running in the worktree as `stalled <N>m turn_died <last status>` (`no_status` when the status file is missing), once per dead turn, even when the old status was `done` or `waiting`. If a harness *is* running, the `approval?` rules below apply unchanged (so a quiet `done` thread is still not flagged).
+
+A thread writes `.grokbot` with its first command, after its first prompt, so that prompt's hook finds no marker. In a T3 worktree (`T3CODE_THREAD_ID` set, or a path under `~/.t3/worktrees/`) the hook leaves a small pending note instead, and the next sweep adopts it once `.grokbot` exists (or drops it if the turn ended first, or after 24 hours). Hook runs from other threads start that sweep, so a first-turn death is noticed as long as anything else on the machine runs a hook, or the launchd sweep below is installed. The hook does no network call and no `t3` CLI call beyond what the registry already caches, and does nothing outside marked or T3 worktrees. Interrupting a turn with Esc fires no Stop either; if the harness is then gone you get one `turn_died` ping.
 
 ## Actionable status and stall checks
 
@@ -139,6 +145,7 @@ The first word of `.grokbot-status` controls delivery:
 | `needs_input`, `failed` | Always send, even when repeated. |
 | `milestone <what>`, `done ...` | Send. |
 | `stalled <minutes>m <original status>` | Sweep alert after 45 minutes without status changes or successful pings, if no harness is running. One attempt per status revision. |
+| `stalled <N>m turn_died <last status>` | Sweep alert: a turn started (turn-start hook) but never ended (no Stop), and no harness is left in the worktree, for at least 45 minutes. Sent whatever the old status was, `done` and `waiting` included, once per dead turn. Treat it like `failed`. See [dead turns](#dead-turns). |
 | `stalled <N>m approval? <original status>` | Sweep alert when a harness *is* running but nothing has changed for N minutes; it may be blocked on an approval prompt. See [the stall fallback](docs/hooks.md#stall-fallback-in-the-sweep). |
 | `needs_input approval ...` | Not a status-file value: the approval hooks send it mid-turn. Always sent, no dedupe, status file untouched. |
 | Any other word | Send for compatibility. This includes `continuing`, `turn_ended_no_status`, and `worktree_missing`. |
@@ -207,7 +214,8 @@ launchd sees them too; `GROKBOT_HOOKS_DIR` has to be an environment variable.
 Run `python3 tests/notify-http-test.py` for local HTTP payload tests for all three paths.
 Run `bash tests/install-test.sh` for the installer and uninstaller against a temporary HOME.
 Run `bash tests/stall-test.sh` for stall watchdog cases.
-Run `bash tests/notify-test.sh` (and `tests/registry-test.sh`, `tests/stall-test.sh`, `tests/install-test.sh`, `python3 tests/notify-http-test.py`) for isolated tests with a stub curl. The tests
+Run `bash tests/turn-start-test.sh` for the turn-start hook and dead-turn cases.
+Run `bash tests/notify-test.sh` (and `tests/registry-test.sh`, `tests/stall-test.sh`, `tests/turn-start-test.sh`, `tests/install-test.sh`, `python3 tests/notify-http-test.py`) for isolated tests with a stub curl. The tests
 use temporary HOME, hooks, and state directories and make no real HTTP requests.
 
 ## Configuration

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Remove the Grok Bot hook entries (Stop, Notification, PermissionRequest) from Codex and
+# Remove the Grok Bot hook entries (Stop, Notification, PermissionRequest, UserPromptSubmit) from Codex and
 # every Claude Code config dir found the same way install.sh finds them. Other keys and other hooks are left alone.
 # Leaves ~/.grokbot-hooks (scripts, config, logs and <bot>.env files) in place; delete it yourself if you want.
 set -euo pipefail

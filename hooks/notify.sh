@@ -1,7 +1,8 @@
 #!/bin/bash
 # shellcheck disable=SC2016 # Single-quoted expressions are jq programs.
-# Actionable Stop notifications, approval-prompt pings (claude-notify, codex-permission)
-# and --sweep, which checks saved worktrees for stalls (no harness, or a running harness gone quiet).
+# Actionable Stop notifications, approval-prompt pings (claude-notify, codex-permission),
+# turn-start bookkeeping (claude-start, codex-start; sends nothing) and --sweep, which checks saved
+# worktrees for stalls (a dead turn, no harness, or a running harness gone quiet).
 HARNESS="${1:-unknown}"
 DIR="${GROKBOT_HOOKS_DIR:-$HOME/.grokbot-hooks}"
 [ -d "$DIR" ] || exit 0  # not installed
@@ -69,6 +70,8 @@ post() {
   # At most one request per revision, even on HTTP failure or worker crash.
   if [ "$HARNESS" = sweep ] && [[ "$STATUS" = stalled\ * ]]; then
     touch "$STATE/$KEY.stalled" || return 1
+    # A dead turn is reported once per turn start, whatever happens to the status file.
+    [ -z "${TURN_DEAD:-}" ] || write_epoch "$STATE/$KEY.turndead" "$TURN_START" || return 1
   fi
   # Never log curl diagnostics: they can contain a secret URL.
   http="$(curl -sS -m 10 -X POST "$GROKBOT_WEBHOOK_URL" -H 'Content-Type: application/json' \
@@ -77,6 +80,50 @@ post() {
   result=$?
   echo "$TS $BOT webhook http=$http result=$result" >> "$LOG"
   [ "$result" -eq 0 ] && [[ "$http" = 2?? ]]
+}
+
+# write_epoch <file> <number>: atomic one-line write.
+write_epoch() {
+  printf '%s\n' "$2" > "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"
+}
+
+state_key() {
+  printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+}
+
+# Turn bookkeeping, one pair of files per worktree in $STATE (epoch seconds):
+#   <key>.turn_started  written by the turn-start hook (UserPromptSubmit)
+#   <key>.turn_ended    written by the Stop hook
+# A turn is open when it started at or after the last end (ties count as open: a queued message can
+# start in the same second the previous turn ended). turn_open <key> sets TURN_START.
+turn_open() {
+  local s e
+  s="$(cat "$STATE/$1.turn_started" 2>/dev/null)"
+  e="$(cat "$STATE/$1.turn_ended" 2>/dev/null)"
+  case "$s" in *[!0-9]*|'') return 1 ;; esac
+  case "$e" in *[!0-9]*|'') e=0 ;; esac
+  [ "$s" -ge "$e" ] || return 1
+  TURN_START="$s"
+}
+
+# A T3 worktree: the harness has T3CODE_THREAD_ID, or the path is under T3's worktrees directory.
+is_t3_worktree() {
+  [ -z "$REG_ENV_THREAD" ] || return 0
+  case "$1" in "${T3CODE_HOME:-$HOME/.t3}/worktrees/"*) return 0 ;; esac
+  return 1
+}
+
+# ensure_marker <worktree> <bot>: record or refresh worktree -> bot. Exact match on the path column,
+# one line per worktree, newest last, capped at 500 entries. Skipped when the line is already there.
+ensure_marker() {
+  local root="$1" bot="$2" tmp
+  if [ -n "$bot" ] && ! awk -F'\t' -v r="$root" -v b="$bot" '$1==r && $2==b {f=1} END{exit !f}' "$MAP" 2>/dev/null; then
+    tmp="$(mktemp "$DIR/markers.XXXXXX" 2>/dev/null)" && {
+      { awk -F'\t' -v r="$root" '$1!=r' "$MAP" 2>/dev/null; printf '%s\t%s\n' "$root" "$bot"; } | tail -n 500 > "$tmp" \
+        && chmod 600 "$tmp" && mv -f "$tmp" "$MAP"
+      rm -f "$tmp" 2>/dev/null
+    }
+  fi
 }
 
 # A live harness is conservative evidence of an active turn, including tool/CI
@@ -112,15 +159,7 @@ NOW="$(date +%s)"
 if [ -f "$ROOT/.grokbot" ]; then
   # Bot name is sanitised so it can only ever point at a file inside $DIR.
   BOT="$(head -n1 "$ROOT/.grokbot" | tr -cd 'a-z0-9_-')"
-  # Record or refresh worktree -> bot. Exact match on the path column, one line per
-  # worktree, newest last, capped at 500 entries. Skipped when the line is already there.
-  if [ -n "$BOT" ] && ! awk -F'\t' -v r="$ROOT" -v b="$BOT" '$1==r && $2==b {f=1} END{exit !f}' "$MAP" 2>/dev/null; then
-    TMP="$(mktemp "$DIR/markers.XXXXXX" 2>/dev/null)" && {
-      { awk -F'\t' -v r="$ROOT" '$1!=r' "$MAP" 2>/dev/null; printf '%s\t%s\n' "$ROOT" "$BOT"; } | tail -n 500 > "$TMP" \
-        && chmod 600 "$TMP" && mv -f "$TMP" "$MAP"
-      rm -f "$TMP" 2>/dev/null
-    }
-  fi
+  ensure_marker "$ROOT" "$BOT"
   STATUS_FILE="$ROOT/.grokbot-status"
   # Sentinel preserves trailing newlines for byte-exact dedupe of the payload.
   STATUS="$( { [ -f "$STATUS_FILE" ] && head -c 2000 "$STATUS_FILE" || printf turn_ended_no_status; }; printf '.')"
@@ -145,6 +184,7 @@ WORD="$(printf '%s' "$STATUS" | awk 'NR==1 {print $1}')"
 if [ "$HARNESS" = sweep ]; then
   registry_record sweep
 else
+  START_BEFORE="${GROKBOT_HOOK_EPOCH:-}"
   registry_record turn
   registry_resolve "$ROOT" "$REG_ENV_THREAD"
 fi
@@ -168,7 +208,30 @@ if ! "$JQ" -e --arg revision "$REVISION" --arg status "$STATUS"   '.revision == 
     mv -f "$OBSERVED.tmp" "$OBSERVED"
   rm -f "$STATE/$KEY.stalled" "$STATE/$KEY.waiting"
 fi
-if [ "$WORD" = waiting ]; then
+# Dead turn: the turn-start hook recorded a turn that never reported its end (no Stop), and no
+# harness is left in the worktree. This beats the status word below, so a follow-up turn on a
+# `done` or `waiting` thread that died is reported too. With a harness still running the usual
+# rules below apply (approval? ping, waiting reminder, done is skipped).
+TURN_DEAD=
+if [ "$HARNESS" = sweep ] && [ -f "$ROOT/.grokbot" ] && turn_open "$KEY"; then
+  # Once per dead turn, however the status file changes afterwards.
+  [ "$(cat "$STATE/$KEY.turndead" 2>/dev/null)" != "$TURN_START" ] || return 0
+  # Quiet since the later of the turn start and the last status write.
+  LIVE="$(perl -e 'my $m = (stat($ARGV[0]))[9] || 0; print $m > $ARGV[1] ? $m : $ARGV[1]' "$ROOT/.grokbot-status" "$TURN_START")"
+  AGE=$((NOW - LIVE))
+  [ "$AGE" -ge "$((STALL_MINUTES * 60))" ] || return 0
+  harness_running "$ROOT"
+  case $? in
+    1) TURN_DEAD=1
+       [ -f "$ROOT/.grokbot-status" ] || STATUS=no_status
+       STATUS="stalled $((AGE / 60))m turn_died $STATUS"
+       WORD=stalled ;;
+    2) return 0 ;;  # pgrep or lsof failed: prefer a missed alert to a false one
+  esac
+fi
+if [ -n "$TURN_DEAD" ]; then
+  : # STATUS is final
+elif [ "$WORD" = waiting ]; then
   [ ! -f "$STATE/$KEY.waiting" ] || return 0
   if [ ! -f "$CACHE" ]; then
     "$JQ" -n --argjson clock "$NOW" '{clock:$clock}' > "$CACHE"
@@ -219,6 +282,7 @@ BRANCH="$(git -C "$ROOT" branch --show-current 2>/dev/null)"
 echo "$TS $HARNESS bot=$BOT branch=$BRANCH status=$(printf '%s' "$STATUS" | head -n1 | head -c 80)" >> "$LOG"
 post
 RC=$?
+[ -z "$TURN_DEAD" ] || [ "$RC" -eq 2 ] || registry_mark_stalled "${STATUS#stalled * }"
 if [ "$RC" -eq 0 ]; then
   [ "$WORD" != waiting ] || touch "$STATE/$KEY.waiting"
   "$JQ" -n --arg status "$STATUS" --arg transcript "${TRANSCRIPT:-$SAVED_TRANSCRIPT}" --argjson clock "$(date +%s)" \
@@ -258,6 +322,52 @@ recently_active() {
   return 1
 }
 
+# Turn start (claude-start, codex-start). Runs under the sweep lock: marker map, thread registry.
+# Needs START_EPOCH, the time the hook fired. Sends nothing.
+start_turn() {
+  ROOT="$1"
+  HARNESS="$2"
+  SESSION="${3:-}"
+  LAST=
+  TS="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  [ -f "$ROOT/.grokbot" ] || return 0
+  BOT="$(head -n1 "$ROOT/.grokbot" | tr -cd 'a-z0-9_-')"
+  [ -n "$BOT" ] || return 0
+  ensure_marker "$ROOT" "$BOT"
+  STATUS=running
+  WORD=running
+  registry_record start
+  registry_resolve "$ROOT" "${4:-}"
+}
+
+# Turn starts seen before the worktree had a .grokbot marker (a thread writes it with its first
+# command, after its first prompt). $STATE/pending/<key> holds: worktree, epoch, thread id, harness,
+# session id. Once the marker exists the start is adopted as if the hook had seen it; if the turn
+# has already ended meanwhile (Stop writes turn_ended) it is just dropped. Unclaimed ones expire.
+adopt_pending() {
+  local f root epoch tid harness session key end NOW_P
+  NOW_P="$(date +%s)"
+  [ -d "$STATE/pending" ] || return 0
+  for f in "$STATE"/pending/*; do
+    [ -f "$f" ] || continue
+    { IFS= read -r root; IFS= read -r epoch; IFS= read -r tid; IFS= read -r harness; IFS= read -r session; } < "$f" || true
+    case "$epoch" in *[!0-9]*|'') rm -f "$f"; continue ;; esac
+    if [ -n "$root" ] && [ -f "$root/.grokbot" ]; then
+      key="$(state_key "$root")"
+      end="$(cat "$STATE/$key.turn_ended" 2>/dev/null)"
+      case "$end" in *[!0-9]*|'') end=0 ;; esac
+      if [ "$end" -lt "$epoch" ]; then
+        write_epoch "$STATE/$key.turn_started" "$epoch"
+        START_EPOCH="$epoch"
+        start_turn "$root" "${harness:-claude-start}" "$session" "$tid"
+      fi
+      rm -f "$f"
+    elif [ ! -d "$root" ] || [ "$((NOW_P - epoch))" -gt 86400 ]; then
+      rm -f "$f"
+    fi
+  done
+}
+
 sweep() {
   # Check all known worktrees; process preserves missing-marker delivery.
   while IFS=$'\t' read -r path bot; do
@@ -269,6 +379,15 @@ sweep() {
 
 worker() {
   local mode="$HARNESS"   # process() overwrites HARNESS, so remember whether this is the launchd sweep
+  case "$mode" in
+    claude-start|codex-start)
+      # Bookkeeping only: no sweep, no registry upkeep, so a prompt never waits on more than this.
+      START_EPOCH="${GROKBOT_HOOK_EPOCH:-}"
+      start_turn "$CURRENT" "$mode" "$SESSION_ID" "$REG_ENV_THREAD"
+      echo "$(date '+%Y-%m-%dT%H:%M:%S%z') worker-complete" >> "$LOG"
+      return 0 ;;
+  esac
+  adopt_pending
   [ -z "$CURRENT" ] || process "$CURRENT" "$HARNESS" "$MESSAGE" "$SESSION_ID" "$TRANSCRIPT_PATH" "$CWD"
   [ ! -f "$MAP" ] || sweep
   # Registry upkeep (look up missing thread ids, re-check old rows, prune). Small batches per hook,
@@ -383,6 +502,36 @@ approval() {
   wait
 }
 
+# Turn-start and turn-end hooks, synchronous part: two tiny file writes with the time the hook fired,
+# so the order of start and end never depends on how long the (locked, backgrounded) worker waits.
+# hook_turn_start returns 1 when the worker has nothing to do.
+hook_turn_start() {
+  local key
+  mkdir -p "$STATE" 2>/dev/null || return 1
+  key="$(state_key "$CURRENT")"
+  if [ -f "$CURRENT/.grokbot" ]; then
+    write_epoch "$STATE/$key.turn_started" "$GROKBOT_HOOK_EPOCH" || return 1
+    rm -f "$STATE/pending/$key"
+    return 0
+  fi
+  # No marker yet. A thread writes .grokbot with its first command, after its first prompt, so
+  # remember the start for T3 worktrees only; the next sweep adopts it once the marker exists.
+  is_t3_worktree "$CURRENT" || return 1
+  mkdir -p "$STATE/pending" 2>/dev/null || return 1
+  printf '%s\n%s\n%s\n%s\n%s\n' "$CURRENT" "$GROKBOT_HOOK_EPOCH" "$REG_ENV_THREAD" "$HARNESS" "$SESSION_ID" \
+    > "$STATE/$key.pending.$$" && mv -f "$STATE/$key.pending.$$" "$STATE/pending/$key"
+  return 1
+}
+
+hook_turn_end() {
+  local key
+  [ -f "$CURRENT/.grokbot" ] || [ -d "$STATE/pending" ] || return 0
+  mkdir -p "$STATE" 2>/dev/null || return 0
+  key="$(state_key "$CURRENT")"
+  [ ! -f "$CURRENT/.grokbot" ] || write_epoch "$STATE/$key.turn_ended" "$GROKBOT_HOOK_EPOCH"
+  rm -f "$STATE/pending/$key"
+}
+
 CURRENT=
 SESSION_ID=
 TRANSCRIPT_PATH=
@@ -402,6 +551,12 @@ if [ "$HARNESS" != --sweep ]; then
   esac
   CURRENT="$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null || echo "$CWD")"
   MESSAGE="$(printf '%s' "$INPUT" | "$JQ" -r '.last_assistant_message // empty' 2>/dev/null | head -c 1500)"
+  GROKBOT_HOOK_EPOCH="$(date +%s)"
+  export GROKBOT_HOOK_EPOCH
+  case "$HARNESS" in
+    claude-start|codex-start) hook_turn_start || exit 0 ;;
+    *) hook_turn_end ;;
+  esac
 fi
 if [ "$HARNESS" = --sweep ]; then
   # launchd must retain a live main process until its sweep finishes.
