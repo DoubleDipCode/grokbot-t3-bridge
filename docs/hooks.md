@@ -150,7 +150,13 @@ Both were silent, because a no-marker run was only logged in debug mode. Now the
   "branch": "feat/some-branch",
   "status": "done\nOpened PR, tests pass.",
   "last_message": "Last assistant message, up to 1500 bytes. Empty if the harness does not provide it.",
-  "ended_at": "2026-10-31T12:54:01+0800"
+  "ended_at": "2026-10-31T12:54:01+0800",
+  "thread_id": "T3 thread id, or empty",
+  "thread_title": "Fix the login redirect",
+  "project_id": "T3 project id, or empty",
+  "thread_source": "env",
+  "my_open_threads": ["<thread id>|done|feat/some-branch|Fix the login redirect"],
+  "my_open_threads_more": 0
 }
 ```
 
@@ -167,11 +173,34 @@ Both were silent, because a no-marker run was only logged in debug mode. Now the
 | `status` | See the status table below. |
 | `last_message` | `last_assistant_message` from either harness; empty if absent. |
 | `ended_at` | Local time the hook ran, with UTC offset. |
+| `thread_id` | The T3 thread behind this worktree. Empty when it could not be found; fall back to `branch` and `worktree`. Plain Claude Code and Codex CLI sessions have no T3 thread, so it is empty there. |
+| `thread_title`, `project_id` | Title and T3 project id of that thread. Empty when unknown. |
+| `thread_source` | How the id was found: `env` (T3 put `T3CODE_THREAD_ID` in the hook's environment), `t3db` (read-only lookup by worktree path), or empty. |
+| `my_open_threads` | At most `GROKBOT_SUMMARY_MAX` (default 8) lines `thread id\|status word\|branch\|title`, newest first, for this bot only: open threads, `done` ones until T3 settles or archives them, and `worktree_missing`. `-` stands for an unknown id. The title is cut to 40 characters and `\|` inside values becomes `/`. |
+| `my_open_threads_more` | How many more open threads the bot has beyond the lines listed. |
 
 Sweep callbacks keep `harness: "sweep"` and leave the three new fields empty.
 No session identity is cached or inferred from another worktree. The bot must
 use its task record to resolve a sweep. Status dedupe remains per worktree and
 compares status only; new metadata does not force delivery.
+
+All thread fields are additions: the original fields and their meaning are
+unchanged. Titles and last messages come from T3 and the agent; treat them as
+untrusted data, like `status`. They are hints for finding a thread, not instructions.
+
+### Thread registry
+
+Every hook run records the worktree in `~/.grokbot-hooks/threads.sqlite` (mode 600, WAL; needs `sqlite3`, which ships with macOS). One row per worktree: bot, T3 thread id, title, project, branch, harness, session id, latest status word and note, an excerpt of the last message, T3 status and PR link, `state` (`open`, `done`, `worktree_missing`, `archived`, `settled` or `removed`) and timestamps. It is updated on every turn, including turns that are not sent (waiting, duplicates). Sweeps only update rows that exist, so a pruned row stays pruned. The first run imports `markers.tsv`; the sweep still reads that file.
+
+How the thread id is found, first match wins:
+
+1. `T3CODE_THREAD_ID` in the hook's environment. T3 sets it for Claude Code sessions it starts. Only the hook of the current session uses it, never a sweep looking at other worktrees.
+2. A read-only lookup by worktree path in T3's database (`~/.t3/userdata/statev2.sqlite`, or `$T3CODE_HOME/userdata/...`). Codex sessions need this, because T3 gives them no environment variable. It reads T3's internal storage, which is not a public interface, so it is the first thing to check after a T3 update (`thread_source` shows `t3db` when it was used). Any failure means "unknown"; the callback still goes out.
+3. The id already stored for the worktree.
+
+A candidate is checked with T3's own command, `t3 thread show <id> --json`, which must report the same worktree; this also fills in the title, project, archived and settled flags, and detects deleted threads. If that command fails, the candidate is used unchecked, and the command is skipped for five minutes so a stopped T3 cannot slow the hook. A row is re-checked at most every 10 minutes by the hook and every 30 minutes by the sweep. Rows that are archived, settled or removed are deleted after 30 days.
+
+Settings (environment or `~/.grokbot-hooks/config`): `GROKBOT_REGISTRY=0` turns it all off (the new payload fields are then empty), `GROKBOT_SUMMARY_MAX` (default 8, 0 leaves `my_open_threads` empty), `GROKBOT_T3_CLI`, `GROKBOT_T3_DB`, `GROKBOT_T3_DB_LOOKUP=0` (never read T3's database). Look at it by hand with `sqlite3 -readonly ~/.grokbot-hooks/threads.sqlite 'select bot,state,status_word,thread_id,title from threads order by updated_at desc limit 20'`. The file is safe to delete; it is rebuilt from `markers.tsv` and from later turns. `notify.log` shows `registry-error` lines when something failed.
 
 ### Status values
 
@@ -227,7 +256,7 @@ To see which worktrees the hook knows about:
 cat ~/.grokbot-hooks/markers.tsv
 ```
 
-It is safe to delete this file. It is rebuilt as marked worktrees end turns.
+It is safe to delete this file. It is rebuilt as marked worktrees end turns. `threads.sqlite` (see [Thread registry](#thread-registry)) holds the T3 thread behind each worktree.
 
 
 The sweep can send `stalled <minutes>m <original status>` after 45 minutes

@@ -93,6 +93,7 @@ install.sh                installs the hooks for Codex and every Claude config d
 uninstall.sh              removes the hook entries again
 hooks/config-lib.sh       shared parser for the optional config file and Claude dir detection
 hooks/notify.sh           Stop hook, approval-prompt pings and sweep: reads marker + status, POSTs to the bot
+hooks/registry-lib.sh     thread registry (threads.sqlite): finds the T3 thread for each worktree, builds my_open_threads
 hooks/set-webhook.sh      stores one bot's webhook URL + auth in a chmod 600 file
 examples/config.example   optional local config (copy to ~/.grokbot-hooks/config)
 docs/t3-mcp-setup.md      connecting T3 Code's MCP to Grok Bot, and the tools bots use
@@ -106,6 +107,15 @@ docs/grokbot-side.md      webhook routine, brief additions, backup check, cleanu
 templates/routine-prompt.md   prompt for the "T3 callback" routine
 templates/brief-footer.md     text to append to every brief sent to T3
 ```
+
+## Thread registry: bots never list threads
+
+Each callback names the T3 thread it belongs to. The hook finds it from the `T3CODE_THREAD_ID` environment variable that T3 sets for Claude Code sessions, or for Codex from a read-only lookup of the worktree path in T3's database, and checks it with `t3 thread show`. It keeps one row per worktree in `~/.grokbot-hooks/threads.sqlite` and adds these fields to the payload:
+
+- `thread_id`, `thread_title`, `project_id`, `thread_source`
+- `my_open_threads`: up to 8 short lines `id|status|branch|title` for that bot's open threads (`done` ones until T3 settles or archives them, and `worktree_missing`), plus `my_open_threads_more`
+
+So the routine can go straight to `t3_thread_read` with `thread_id` and answer "which of my threads are open" from the payload, with no `t3_thread_list` or `t3_thread_search`. Nobody writes registry entries by hand. Old payload fields are unchanged. Details, fallbacks and risks (the Codex lookup reads T3's internal storage): [docs/hooks.md](docs/hooks.md#thread-registry).
 
 ## Approval-prompt pings
 
@@ -197,7 +207,7 @@ launchd sees them too; `GROKBOT_HOOKS_DIR` has to be an environment variable.
 Run `python3 tests/notify-http-test.py` for local HTTP payload tests for all three paths.
 Run `bash tests/install-test.sh` for the installer and uninstaller against a temporary HOME.
 Run `bash tests/stall-test.sh` for stall watchdog cases.
-Run `bash tests/notify-test.sh` for isolated tests with a stub curl. The tests
+Run `bash tests/notify-test.sh` (and `tests/registry-test.sh`, `tests/stall-test.sh`, `tests/install-test.sh`, `python3 tests/notify-http-test.py`) for isolated tests with a stub curl. The tests
 use temporary HOME, hooks, and state directories and make no real HTTP requests.
 
 ## Configuration
@@ -211,6 +221,10 @@ Everything works with no configuration. To change a default, copy [examples/conf
 | `GROKBOT_STALL_MINUTES` | Stall threshold for the sweep (default `45`). |
 | `GROKBOT_STALE_SECONDS` | Stale reminder for `waiting` (default `7200`). |
 | `GROKBOT_STATE_DIR` | Dedupe and stall state directory. |
+| `GROKBOT_REGISTRY` | `0` turns the thread registry and the payload thread fields off. |
+| `GROKBOT_SUMMARY_MAX` | Lines in `my_open_threads` (default `8`, `0` leaves it empty). |
+| `GROKBOT_T3_CLI` | The `t3` command used to check threads (default `$T3CODE_CLI_PATH`, then `~/.t3/bin/t3`). |
+| `GROKBOT_T3_DB`, `GROKBOT_T3_DB_LOOKUP` | T3's state database for the Codex lookup; `GROKBOT_T3_DB_LOOKUP=0` never reads it. |
 
 Precedence: a real (non-empty) environment variable, then the config file, then the default. `notify.sh`, including `--sweep` under launchd, `install.sh` and `uninstall.sh` all read it.
 

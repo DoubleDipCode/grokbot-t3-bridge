@@ -27,6 +27,7 @@ done
 [ "$(cmds "$HOME/.claude/settings.json" Notification | grep -c 'echo other')" = 1 ] || { echo 'FAIL: other hook dropped'; exit 1; }
 [ "$(cmds "$HOME/.codex/hooks.json" PermissionRequest | grep -c 'notify.sh codex-permission')" = 1 ] || { echo 'FAIL: codex PermissionRequest'; exit 1; }
 [ "$(cmds "$HOME/.codex/hooks.json" Stop | grep -c 'notify.sh codex$')" = 1 ] || { echo 'FAIL: codex Stop'; exit 1; }
+[ -x "$HOME/.grokbot-hooks/registry-lib.sh" ] || { echo 'FAIL: registry-lib.sh not installed'; exit 1; }
 # Idempotent: a second run changes nothing and makes no new backup.
 before="$(find "$HOME" -name '*.bak-grokbot-*' | wc -l | tr -d ' ')"
 sum1="$(cat "$HOME"/.claude*/settings.json "$HOME/.codex/hooks.json" | shasum)"

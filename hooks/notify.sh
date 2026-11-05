@@ -22,8 +22,24 @@ umask 077                # anything this script creates (log, map) is private to
 # tell and the sweep silently skips every stall ping while a harness process exists.
 PATH="$PATH:/usr/sbin:/sbin"
 
+# Thread id from the harness environment: T3 sets T3CODE_THREAD_ID for Claude Code sessions. The
+# sweep workers inherit it from the hook that started them, so only the current worktree may use it.
+REG_ENV_THREAD="${T3CODE_THREAD_ID:-}"
+
 # Prefer jq from PATH, fall back to /usr/bin/jq. Hooks often run with a minimal PATH.
 JQ="$(command -v jq 2>/dev/null || echo /usr/bin/jq)"
+
+# Thread registry (threads.sqlite). Optional: without registry-lib.sh next to this script the
+# payload simply has no thread fields. Every registry call is best effort and never blocks a ping.
+# shellcheck source=hooks/registry-lib.sh
+if [ -f "$DIR/registry-lib.sh" ]; then
+  . "$DIR/registry-lib.sh" || true
+fi
+if ! type registry_record >/dev/null 2>&1; then
+  registry_record() { :; }; registry_resolve() { :; }; registry_refresh() { :; }
+  registry_load_thread() { THREAD_ID=; THREAD_TITLE=; PROJECT_ID=; THREAD_SOURCE=; }
+  registry_summary() { SUMMARY_JSON='[]'; SUMMARY_MORE=0; }
+fi
 
 # Keep the log bounded: one rotation at about 1 MB. no-marker lines are logged on every
 # turn of your own sessions too, so this stops them piling up forever.
@@ -32,7 +48,7 @@ if [ -f "$LOG" ] && [ "$(wc -c < "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; t
 fi
 
 # post: POST the payload built from the globals BOT ROOT HARNESS BRANCH STATUS LAST TS SESSION
-# TRANSCRIPT SESSION_CWD. Returns 0 on HTTP 2xx, 1 on failure, 2 when the bot has no webhook.
+# TRANSCRIPT SESSION_CWD, plus the registry's thread fields. Returns 0 on HTTP 2xx, 1 on failure, 2 when the bot has no webhook.
 post() {
   local env="$DIR/$BOT.env" body http result
   [ -f "$env" ] || return 2
@@ -41,10 +57,14 @@ post() {
   # shellcheck disable=SC1090
   . "$env"
   [ -n "$GROKBOT_WEBHOOK_URL" ] || return 2
+  registry_load_thread "$ROOT"
+  registry_summary "$BOT"
   body="$("$JQ" -n --arg bot "$BOT" --arg harness "$HARNESS" --arg worktree "$ROOT" \
     --arg branch "$BRANCH" --arg status "$STATUS" --arg last "$LAST" --arg ts "$TS" \
     --arg session "$SESSION" --arg transcript "$TRANSCRIPT" --arg cwd "$SESSION_CWD" \
-    '{event:"t3_turn_ended",bot:$bot,harness:$harness,worktree:$worktree,branch:$branch,status:$status,last_message:$last,ended_at:$ts,cwd:$cwd,session_id:$session,transcript_path:$transcript}')" || return 1
+    --arg thread_id "${THREAD_ID:-}" --arg thread_title "${THREAD_TITLE:-}" --arg project_id "${PROJECT_ID:-}" \
+    --arg thread_source "${THREAD_SOURCE:-}" --argjson open_threads "${SUMMARY_JSON:-[]}" --argjson open_more "${SUMMARY_MORE:-0}" \
+    '{event:"t3_turn_ended",bot:$bot,harness:$harness,worktree:$worktree,branch:$branch,status:$status,last_message:$last,ended_at:$ts,cwd:$cwd,session_id:$session,transcript_path:$transcript,thread_id:$thread_id,thread_title:$thread_title,project_id:$project_id,thread_source:$thread_source,my_open_threads:$open_threads,my_open_threads_more:$open_more}')" || return 1
   # Record stall attempts only once a payload and webhook are available.
   # At most one request per revision, even on HTTP failure or worker crash.
   if [ "$HARNESS" = sweep ] && [[ "$STATUS" = stalled\ * ]]; then
@@ -120,6 +140,14 @@ fi
 KEY="$(printf '%s' "$ROOT" | shasum -a 256 | awk '{print $1}')"
 CACHE="$STATE/$KEY.json"
 WORD="$(printf '%s' "$STATUS" | awk 'NR==1 {print $1}')"
+# Registry first, so it is current even when this turn is not sent (waiting, duplicate). Sweeps
+# only update rows they already know; the thread id of other worktrees never comes from our env.
+if [ "$HARNESS" = sweep ]; then
+  registry_record sweep
+else
+  registry_record turn
+  registry_resolve "$ROOT" "$REG_ENV_THREAD"
+fi
 SAVED_TRANSCRIPT="$("$JQ" -r '.transcript // empty' "$CACHE" 2>/dev/null)"
 # Keep the newest transcript path even when this Stop is not sent (dedupe, waiting): the stall
 # check uses it, and a new session in the same worktree must replace the old one's path.
@@ -240,8 +268,14 @@ sweep() {
 }
 
 worker() {
+  local mode="$HARNESS"   # process() overwrites HARNESS, so remember whether this is the launchd sweep
   [ -z "$CURRENT" ] || process "$CURRENT" "$HARNESS" "$MESSAGE" "$SESSION_ID" "$TRANSCRIPT_PATH" "$CWD"
   [ ! -f "$MAP" ] || sweep
+  # Registry upkeep (look up missing thread ids, re-check old rows, prune). Small batches per hook,
+  # bigger ones for the launchd sweep. Skipped when nothing was ever recorded.
+  if [ -f "$REG_DB" ] || [ -f "$MAP" ]; then
+    if [ "$mode" = --sweep ]; then registry_refresh full; else registry_refresh; fi
+  fi
   echo "$(date '+%Y-%m-%dT%H:%M:%S%z') worker-complete" >> "$LOG"
 }
 
@@ -335,6 +369,13 @@ approval() {
   TRANSCRIPT="$TRANSCRIPT_PATH"
   SESSION_CWD="$CWD"
   LAST="$MESSAGE"
+  # Registry: keep the thread row current, using the status file as it is (this ping does not
+  # change it). A first event for a worktree may be an approval prompt, so this can create the row.
+  STATUS="$( { [ -f "$ROOT/.grokbot-status" ] && head -c 2000 "$ROOT/.grokbot-status" || printf turn_ended_no_status; }; printf '.')"
+  STATUS="${STATUS%.}"
+  WORD="$(printf '%s' "$STATUS" | awk 'NR==1 {print $1}')"
+  registry_record approval
+  registry_resolve "$ROOT" "$REG_ENV_THREAD"
   BRANCH="$(git -C "$ROOT" branch --show-current 2>/dev/null)"
   STATUS="needs_input approval $SUMMARY"
   echo "$TS $HARNESS bot=$BOT branch=$BRANCH status=$(printf '%s' "$STATUS" | head -c 80)" >> "$LOG"
