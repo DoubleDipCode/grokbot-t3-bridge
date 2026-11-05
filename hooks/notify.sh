@@ -268,12 +268,13 @@ sweep() {
 }
 
 worker() {
+  local mode="$HARNESS"   # process() overwrites HARNESS, so remember whether this is the launchd sweep
   [ -z "$CURRENT" ] || process "$CURRENT" "$HARNESS" "$MESSAGE" "$SESSION_ID" "$TRANSCRIPT_PATH" "$CWD"
   [ ! -f "$MAP" ] || sweep
   # Registry upkeep (look up missing thread ids, re-check old rows, prune). Small batches per hook,
   # bigger ones for the launchd sweep. Skipped when nothing was ever recorded.
   if [ -f "$REG_DB" ] || [ -f "$MAP" ]; then
-    if [ "$HARNESS" = --sweep ]; then registry_refresh full; else registry_refresh; fi
+    if [ "$mode" = --sweep ]; then registry_refresh full; else registry_refresh; fi
   fi
   echo "$(date '+%Y-%m-%dT%H:%M:%S%z') worker-complete" >> "$LOG"
 }

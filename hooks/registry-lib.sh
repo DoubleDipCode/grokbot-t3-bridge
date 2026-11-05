@@ -104,7 +104,8 @@ CREATE TABLE IF NOT EXISTS threads (
   final_since   INTEGER,
   first_seen    TEXT NOT NULL,
   updated_at    TEXT NOT NULL,
-  enriched_at   INTEGER
+  enriched_at   INTEGER,
+  resolve_tried INTEGER
 );
 CREATE INDEX IF NOT EXISTS threads_bot_state ON threads(bot, state, updated_at);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
@@ -151,6 +152,7 @@ SQL
 #             pruned) and moves updated_at only when the status changed.
 registry_record() {
   local mode="$1" branch note set upd ins
+  REG_SNAP_ROOT=
   registry_init || return 0
   branch="$(git -C "$ROOT" branch --show-current 2>/dev/null)"
   note="${STATUS#"$WORD"}"
@@ -246,6 +248,7 @@ reg_verify() {
 # reg_store <root> <id> <source> <verified 0|1> [title project]: writes the thread fields of a row.
 # Verified data comes from the CLI (V_*); unverified data keeps the title and project given.
 reg_store() {
+  REG_SNAP_ROOT="$1"; THREAD_ID="$2"; THREAD_SOURCE="$3"
   local root="$1" id="$2" src="$3" verified="$4" title project pr st arch settl enriched
   if [ "$verified" = 1 ]; then
     title="$V_TITLE"; project="$V_PROJECT"; pr="$V_PR"; st="$V_STATUS"; arch="$V_ARCHIVED"; settl="$V_SETTLED"; enriched="$(date +%s)"
@@ -254,6 +257,7 @@ reg_store() {
   fi
   reg_clean "$title" 200 field; title="$REG_C"
   reg_clean "$project" 200; project="$REG_C"
+  THREAD_TITLE="$title"; PROJECT_ID="$project"
   local q_root q_id q_src q_title q_proj q_pr q_st
   reg_q "$root"; q_root="$REG_Q"; reg_q "$id"; q_id="$REG_Q"; reg_q "$src"; q_src="$REG_Q"
   reg_q "$title"; q_title="$REG_Q"; reg_q "$project"; q_proj="$REG_Q"
@@ -280,10 +284,29 @@ COMMIT;
 SQL
 }
 
+# reg_clear_thread <root> <id>: T3 says <id> lives in another worktree, so this row must not name it.
+# Conditional on the id, so a newer mapping written meanwhile is left alone.
+reg_clear_thread() {
+  reg_q "$1"; local qr="$REG_Q"
+  reg_q "$2"
+  reg_run >/dev/null <<SQL || true
+UPDATE threads SET thread_id=NULL, thread_source=NULL, title=NULL, project_id=NULL, pr_url=NULL, t3_status=NULL,
+  archived=0, settled=0, removed=0, enriched_at=NULL WHERE worktree=$qr AND thread_id=$REG_Q;
+UPDATE threads SET state=$REG_STATE_SQL WHERE worktree=$qr;
+SQL
+}
+
 # registry_resolve <root> [env thread id]
 # Finds the T3 thread behind ROOT and stores it. Only the hook of the current session may pass an
 # env id: a sweep looking at other worktrees must not.
 registry_resolve() {
+  REG_SNAP_ROOT=
+  reg__resolve "$@"
+  # Paths that kept the stored thread (fresh, or nothing better found) did not call reg_store.
+  [ -n "$REG_SNAP_ROOT" ] || { registry_load_thread "$1"; REG_SNAP_ROOT="$1"; }
+  return 0
+}
+reg__resolve() {
   local root="$1" env_id="${2:-}" now row cached cenr fresh=0 rc src
   registry_init || return 0
   [ -d "$root" ] || return 0
@@ -320,6 +343,7 @@ registry_resolve() {
       0) reg_q "$root"; src="$(reg_run <<< "SELECT COALESCE(thread_source,'') FROM threads WHERE worktree=$REG_Q;")"
          reg_store "$root" "$cached" "$src" 1 ;;
       3) reg_mark_removed "$root" ;;
+      1) reg_clear_thread "$root" "$cached"; THREAD_ID=; THREAD_TITLE=; PROJECT_ID=; THREAD_SOURCE=; REG_SNAP_ROOT="$root" ;;
     esac
   fi
   return 0
@@ -328,6 +352,9 @@ registry_resolve() {
 # registry_load_thread <root>: sets THREAD_ID THREAD_TITLE PROJECT_ID THREAD_SOURCE (empty if unknown).
 registry_load_thread() {
   local row
+  # The callback's own resolution wins over the shared row: an approval ping for the same worktree
+  # running at the same time (it takes no lock) could have rewritten the row in between.
+  [ "${REG_SNAP_ROOT:-}" != "$1" ] || return 0
   THREAD_ID=; THREAD_TITLE=; PROJECT_ID=; THREAD_SOURCE=
   reg_on && [ -f "$REG_DB" ] || return 0
   reg_q "$1"
@@ -342,6 +369,9 @@ registry_summary() {
   local max="${GROKBOT_SUMMARY_MAX:-8}" out n lines sql
   SUMMARY_JSON='[]'; SUMMARY_MORE=0
   case "$max" in *[!0-9]*|'') max=8 ;; esac
+  [ "${#max}" -le 2 ] || max=20
+  max=$((10#$max))   # "08" is decimal, not an octal error
+  [ "$max" -le 20 ] || max=20
   [ "$max" -gt 0 ] || return 0
   reg_on && [ -f "$REG_DB" ] || return 0
   reg_q "$1"
@@ -361,13 +391,18 @@ SELECT COALESCE(NULLIF(thread_id,''),'-') || '|' || COALESCE(status_word,'') || 
 # registry_refresh [full]: end of a worker run. Resolves rows that have no thread yet, re-checks the
 # oldest stale rows (3 + 3 per call, 20 + 10 with "full" from the launchd sweep) and deletes final rows older than REG_PRUNE_DAYS.
 registry_refresh() {
-  local now path id rows sql n_new=3 n_old=3
-  [ "${1:-}" != full ] || { n_new=20; n_old=10; }
+  local now path id rows sql n_new=3 n_old=3 budget=12 deadline
+  [ "${1:-}" != full ] || { n_new=20; n_old=10; budget=60; }
   registry_init || return 0
   now="$(date +%s)"
-  rows="$(reg_run <<< "SELECT worktree FROM threads WHERE thread_id IS NULL AND state IN ('open','done') ORDER BY updated_at DESC LIMIT $n_new;")" || return 0
+  deadline=$((now + budget))   # the sweep lock is held meanwhile: stop early rather than delay callbacks
+  rows="$(reg_run <<< "SELECT worktree FROM threads WHERE thread_id IS NULL AND state IN ('open','done') ORDER BY COALESCE(resolve_tried,0), updated_at DESC LIMIT $n_new;")" || return 0
   while IFS= read -r path; do
-    [ -n "$path" ] && registry_resolve "$path"
+    [ -n "$path" ] || continue
+    [ "$(date +%s)" -lt "$deadline" ] || break
+    # Remember the attempt so rows that never resolve (not T3 worktrees) do not hog every batch.
+    reg_q "$path"; reg_run >/dev/null <<< "UPDATE threads SET resolve_tried=$(date +%s) WHERE worktree=$REG_Q;" || true
+    registry_resolve "$path"
   done <<< "$rows"
   sql="SELECT worktree, thread_id FROM threads
  WHERE thread_id IS NOT NULL AND state IN ('open','done','worktree_missing')
@@ -376,6 +411,7 @@ registry_refresh() {
   rows="$(reg_run <<< "$sql")" || return 0
   while IFS="$REG_US" read -r path id; do
     [ -n "$path" ] && [ -n "$id" ] || continue
+    [ "$(date +%s)" -lt "$deadline" ] || break
     if [ ! -d "$path" ]; then
       # Gone from disk: T3 may still know the thread (settled/archived), so ask about it by id only.
       reg_verify_by_id "$path" "$id"
@@ -398,7 +434,10 @@ reg_verify_by_id() {
   out="$(reg_timeout 8 "$cli" thread show "$id" --json --messages 0 2>&1 </dev/null)"
   rc=$?
   if [ "$rc" -ne 0 ]; then
-    case "$out" in *'no longer available'*) reg_mark_removed "$root" ;; esac
+    case "$out" in
+      *'no longer available'*) reg_mark_removed "$root" ;;
+      *) touch "$STATE/t3cli.fail" 2>/dev/null; echo "$TS registry-error t3-cli rc=$rc" >> "$LOG" ;;
+    esac
     return 0
   fi
   local flags

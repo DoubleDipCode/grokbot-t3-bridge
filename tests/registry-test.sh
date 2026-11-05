@@ -242,6 +242,27 @@ hook claude "$W1" 'idle config' tid1
 expect "$(last '.my_open_threads | length')" 1 'config file summary cap'
 rm -f "$GROKBOT_HOOKS_DIR/config" "$GROKBOT_HOOKS_DIR/config-lib.sh"
 
+# ---- 12b. Review findings: octal setting, rejected cached id, unresolvable rows do not starve others --
+GROKBOT_SUMMARY_MAX=08 hook claude "$W1" 'idle octal' tid1
+expect "$(last .event)" t3_turn_ended '08 summary setting must not stop the callback'
+[ "$(last '.my_open_threads | length')" -le 8 ] || fail 'summary cap 08'
+GROKBOT_SUMMARY_MAX=99999999999999999999 hook claude "$W1" 'idle huge' tid1
+[ "$(last '.my_open_threads | length')" -le 20 ] || fail 'summary hard cap'
+# A cached id that T3 now places in another worktree is dropped, not sent.
+fixture tid1 "$TMP/moved-elsewhere" 'Moved'
+REG_SQL "UPDATE threads SET enriched_at=$old WHERE worktree='$W1'"
+GROKBOT_T3_DB_LOOKUP=0 hook codex "$W1" 'idle after move'
+expect "$(last .thread_id)" '' 'rejected cached id not in callback'
+expect "$(REG "SELECT thread_id IS NULL FROM threads WHERE worktree='$W1'")" 1 'rejected cached id cleared'
+fixture tid1 "$W1" 'Back again'
+# Hook-driven refreshes look at 3 unresolved rows per run: the ones already tried go to the back.
+WA="$(mkworktree wa test)"; WB="$(mkworktree wb test)"; WC="$(mkworktree wc test)"; WL="$(mkworktree wl test)"
+for w in "$WL" "$WA" "$WB" "$WC"; do GROKBOT_T3_DB_LOOKUP=0 hook codex "$w" 'idle'; done
+db_thread tidL "$WL" 'Late thread'; fixture tidL "$WL" 'Late thread'
+hook claude "$W1" 'idle r1' tid1
+hook claude "$W1" 'idle r2' tid1
+expect "$(REG "SELECT thread_id FROM threads WHERE worktree='$WL'")" tidL 'older unresolved row eventually resolved'
+
 # ---- 13. notify.sh without registry-lib.sh still works (partial install) -------------------------
 mkdir -p "$TMP/partial"
 cp "$REPO/hooks/notify.sh" "$TMP/partial/"
