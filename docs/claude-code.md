@@ -35,6 +35,10 @@ approval or input):
 }
 ```
 
+To notice a turn that dies before Stop fires, also register `UserPromptSubmit`
+(command `"/absolute/home/.grokbot-hooks/notify.sh" claude-start`, `timeout` 5). It
+prints nothing and sends nothing; see [Turn-start hook](hooks.md#turn-start-hook).
+
 See [Approval-prompt pings](hooks.md#approval-prompt-pings). T3 sets
 `CLAUDE_CONFIG_DIR` per provider, so add both handlers to every settings file it
 uses; `install.sh` does that for `~/.claude`, `$CLAUDE_CONFIG_DIR` and every other

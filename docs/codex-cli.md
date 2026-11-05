@@ -37,6 +37,10 @@ handler next to Stop. It prints no decision, so Codex still shows its normal pro
 }
 ```
 
+To notice a turn that dies before Stop fires, add a `UserPromptSubmit` handler the
+same way (command `"/absolute/home/.grokbot-hooks/notify.sh" codex-start`, `timeout` 5).
+It prints nothing and sends nothing; see [Turn-start hook](hooks.md#turn-start-hook).
+
 Trust it in `/hooks` like the Stop handler. The Codex `notify` setting is not an
 alternative: it only supports `agent-turn-complete`. See
 [Approval-prompt pings](hooks.md#approval-prompt-pings).

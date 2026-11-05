@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install the Grok Bot turn-end and approval-prompt hooks for Codex and Claude Code.
+# Install the Grok Bot turn-start, turn-end and approval-prompt hooks for Codex and Claude Code.
 # Safe to run more than once: it only adds an entry if the event does not already run notify.sh,
 # and backs up a config file (<file>.bak-grokbot-<timestamp>) only when it is about to change it.
 set -euo pipefail
@@ -53,7 +53,8 @@ add_hook() {
 }
 
 # 2. Codex: ~/.codex/hooks.json (created if missing).
-#    Stop pings at turn end; PermissionRequest pings when Codex is about to ask for approval.
+#    Stop pings at turn end; PermissionRequest pings when Codex is about to ask for approval;
+#    UserPromptSubmit records the turn start (sends nothing) so a turn that dies before Stop is noticed.
 CODEX_HOOKS="$HOME/.codex/hooks.json"
 echo "Codex:"
 mkdir -p "$HOME/.codex"
@@ -65,6 +66,8 @@ add_hook "$CODEX_HOOKS" Stop "$(jq -n --arg cmd "$NOTIFY codex" \
   '{type:"command",command:$cmd,timeout:15,statusMessage:"Notifying Grok Bot"}')"
 add_hook "$CODEX_HOOKS" PermissionRequest "$(jq -n --arg cmd "$NOTIFY codex-permission" \
   '{type:"command",command:$cmd,timeout:15,statusMessage:"Notifying Grok Bot"}')"
+add_hook "$CODEX_HOOKS" UserPromptSubmit "$(jq -n --arg cmd "$NOTIFY codex-start" \
+  '{type:"command",command:$cmd,timeout:5,statusMessage:"Recording turn start"}')"
 
 # 3. Claude Code: every config dir that exists. Tools that run Claude Code with several accounts or
 #    providers set CLAUDE_CONFIG_DIR to a different directory each, so ~/.claude alone is not enough.
@@ -86,6 +89,8 @@ for dir in ${CLAUDE_DIRS[@]+"${CLAUDE_DIRS[@]}"}; do
     '{type:"command",command:$cmd,timeout:15}')"
   add_hook "$settings" Notification "$(jq -n --arg cmd "$NOTIFY claude-notify" \
     '{type:"command",command:$cmd,timeout:15}')"
+  add_hook "$settings" UserPromptSubmit "$(jq -n --arg cmd "$NOTIFY claude-start" \
+    '{type:"command",command:$cmd,timeout:5}')"
 done
 [ "${#CLAUDE_DIRS[@]}" -gt 0 ] || echo "  no Claude config dir found (run install.sh again after installing Claude Code)"
 
@@ -93,7 +98,9 @@ cat <<NEXT
 
 Next steps:
   1. Codex only runs hooks you have trusted. Run: codex
-     then type /hooks and trust the "Notifying Grok Bot" Stop and PermissionRequest hooks.
+     then type /hooks and trust the "Notifying Grok Bot" Stop and PermissionRequest hooks and the
+     "Recording turn start" UserPromptSubmit hook. Do this for every Codex home you use, for example
+     plain codex and CODEX_HOME=~/.codex-t3/proxy codex.
      Sessions that were already running keep their old hooks, so test in a new thread.
   2. For each bot, create a "T3 callback" webhook routine in Grok Bot, then run:
        $DEST/set-webhook.sh <bot-name>

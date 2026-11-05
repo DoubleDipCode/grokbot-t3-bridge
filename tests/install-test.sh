@@ -27,6 +27,10 @@ done
 [ "$(cmds "$HOME/.claude/settings.json" Notification | grep -c 'echo other')" = 1 ] || { echo 'FAIL: other hook dropped'; exit 1; }
 [ "$(cmds "$HOME/.codex/hooks.json" PermissionRequest | grep -c 'notify.sh codex-permission')" = 1 ] || { echo 'FAIL: codex PermissionRequest'; exit 1; }
 [ "$(cmds "$HOME/.codex/hooks.json" Stop | grep -c 'notify.sh codex$')" = 1 ] || { echo 'FAIL: codex Stop'; exit 1; }
+for d in .claude .claude-work; do
+  [ "$(cmds "$HOME/$d/settings.json" UserPromptSubmit | grep -c 'grokbot-hooks/notify.sh claude-start$')" = 1 ] || { echo "FAIL: UserPromptSubmit in $d"; exit 1; }
+done
+[ "$(cmds "$HOME/.codex/hooks.json" UserPromptSubmit | grep -c 'notify.sh codex-start$')" = 1 ] || { echo 'FAIL: codex UserPromptSubmit'; exit 1; }
 [ -x "$HOME/.grokbot-hooks/registry-lib.sh" ] || { echo 'FAIL: registry-lib.sh not installed'; exit 1; }
 # Idempotent: a second run changes nothing and makes no new backup.
 before="$(find "$HOME" -name '*.bak-grokbot-*' | wc -l | tr -d ' ')"
