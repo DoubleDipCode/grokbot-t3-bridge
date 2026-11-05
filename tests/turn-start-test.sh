@@ -230,6 +230,23 @@ jq -e 'select(.harness == "codex" and .worktree == "'"$WORK"'")' "$CALLS" >/dev/
 [ "$(row harness)" = codex ] || fail "row harness: $(row harness)"
 [ "$(sqlite3 -batch "$GROKBOT_HOOKS_DIR/threads.sqlite" "SELECT harness||status_word FROM threads WHERE worktree='$OTHER'")" = claude-startrunning ] || [ "$(sqlite3 -batch "$GROKBOT_HOOKS_DIR/threads.sqlite" "SELECT harness||status_word FROM threads WHERE worktree='$OTHER'")" = clauderunning ] || fail 'other worktree not adopted'
 
+# --- 4f. A status write and the next start inside one second: the sweep keeps `running`. ---
+new_work t4f
+hook claude 'done PR'; count 1
+hook claude-start
+sweep; count 1
+[ "$(row status_word)" = running ] || fail "sweep restored the old status: $(row status_word)"
+
+# --- 4g. A stale pending note never replaces a newer turn start. ---
+new_work t4g
+hook claude-start
+NEWER="$(cat "$GROKBOT_STATE_DIR/$KEY.turn_started")"
+mkdir -p "$GROKBOT_STATE_DIR/pending"
+printf '%s\n%s\n\nclaude-start\n\n' "$WORK" "$(( NEWER - 5000000 ))" > "$GROKBOT_STATE_DIR/pending/$KEY"
+sweep
+[ "$(cat "$GROKBOT_STATE_DIR/$KEY.turn_started")" = "$NEWER" ] || fail 'stale pending note replaced a newer turn start'
+[ ! -e "$GROKBOT_STATE_DIR/pending/$KEY" ] || fail 'stale pending note kept'
+
 # --- 5. Harness alive and quiet: the approval? rule is unchanged. ---
 new_work t5
 hook claude 'in_progress build'; count 1                 # the Stop ping

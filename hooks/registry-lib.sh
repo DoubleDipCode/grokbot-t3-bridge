@@ -192,7 +192,7 @@ registry_record() {
   case "$mode" in
     start) started=$((ev / 1000000)) ;;
     turn) ;;
-    *) mtime="$(perl -e 'print((stat($ARGV[0]))[9] // 0)' "$ROOT/.grokbot-status" 2>/dev/null)"
+    *) mtime="$(perl -MTime::HiRes=stat -e 'my @s = stat($ARGV[0]); printf "%d", @s ? $s[9] * 1000000 : 0' "$ROOT/.grokbot-status" 2>/dev/null)"
        case "$mtime" in *[!0-9]*|'') mtime=0 ;; esac ;;
   esac
   set="bot=$q_bot, branch=COALESCE(NULLIF($q_branch,''),branch)"
@@ -203,7 +203,7 @@ registry_record() {
       set="$set, status_word=$q_word, status_note=$q_note, harness=$q_harness, session_id=COALESCE(NULLIF($q_session,''),session_id), last_message=$q_last, updated_at=$q_ts"
       set="$set, started_at=NULL" ;;
     *)
-      keep="(started_at IS NOT NULL AND $mtime < started_at)"
+      keep="(started_at IS NOT NULL AND $mtime < COALESCE(turn_event_us, started_at * 1000000))"
       set="$set, status_word=CASE WHEN $keep THEN status_word ELSE $q_word END, status_note=CASE WHEN $keep THEN status_note ELSE $q_note END"
       set="$set, updated_at=CASE WHEN $keep THEN updated_at WHEN status_word IS NOT $q_word OR status_note IS NOT $q_note THEN $q_ts ELSE updated_at END" ;;
   esac

@@ -353,7 +353,7 @@ start_turn() {
 # session id. Once the marker exists the start is adopted as if the hook had seen it; if the turn
 # has already ended meanwhile (Stop writes turn_ended) it is just dropped. Unclaimed ones expire.
 adopt_pending() {
-  local f root epoch tid harness session key end NOW_P
+  local f root epoch tid harness session key end cur NOW_P
   NOW_P="$(date +%s)"
   [ -d "$STATE/pending" ] || return 0
   for f in "$STATE"/pending/*; do
@@ -364,7 +364,10 @@ adopt_pending() {
       key="$(state_key "$root")"
       end="$(cat "$STATE/$key.turn_ended" 2>/dev/null)"
       case "$end" in *[!0-9]*|'') end=0 ;; esac
-      if [ "$end" -lt "$epoch" ]; then
+      cur="$(cat "$STATE/$key.turn_started" 2>/dev/null)"
+      case "$cur" in *[!0-9]*|'') cur=0 ;; esac
+      # Only a start newer than everything recorded: a later prompt may have run meanwhile.
+      if [ "$end" -lt "$epoch" ] && [ "$cur" -lt "$epoch" ]; then
         write_epoch "$STATE/$key.turn_started" "$epoch"
         # A subshell: start_turn sets globals (HARNESS, ROOT, BOT, ...) the caller still needs.
         ( START_US="$epoch"; start_turn "$root" "${harness:-claude-start}" "$session" "$tid" )
