@@ -155,6 +155,7 @@ count 0
 mv "$GROKBOT_T3_DB" "$GROKBOT_T3_DB.off"
 jq -n '{thread:{threadId:"builder-a",projectId:"proj-1",title:"Builder A: permissions",worktreePath:"x",parentThreadId:"parent",createdBy:"agent",creationSource:"mcp",archived:false}}' > "$FAKE_T3/builder-a.json"
 jq -n --arg wt "$WP" '{thread:{threadId:"parent",projectId:"proj-1",title:"Orchestrator",worktreePath:$wt,archived:false}}' > "$FAKE_T3/parent.json"
+rm -rf "$GROKBOT_STATE_DIR"             # a first hook may run before any state directory exists
 approve "$WA" builder-a
 count 1
 [ "$(last .route)" = parent ] && [ "$(last .parent_thread_id)" = parent ] || fail "cli fallback: $(tail -n1 "$CALLS")"

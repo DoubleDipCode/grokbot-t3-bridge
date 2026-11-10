@@ -472,6 +472,7 @@ reg_thread_info() {
     cli="${GROKBOT_T3_CLI:-${T3CODE_CLI_PATH:-$HOME/.t3/bin/t3}}"
     [ -x "$cli" ] || return 1
     [ ! -f "$STATE/t3cli.fail" ] || [ -n "$(find "$STATE/t3cli.fail" -mmin "+$((REG_BREAKER_SECONDS / 60))" -print 2>/dev/null)" ] || return 1
+    mkdir -p "$STATE" 2>/dev/null || return 1   # the stderr file below lives there (a first hook may find no state dir)
     out="$(reg_timeout 8 "$cli" thread show "$id" --json --messages 0 2>"$STATE/t3err.$$" </dev/null)" || {
       # A dead server must not cost 8 seconds per lookup: same breaker as reg_verify. "No longer
       # available" just means this thread is gone.
