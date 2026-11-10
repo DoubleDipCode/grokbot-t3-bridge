@@ -420,55 +420,64 @@ sweep() {
 # thread's, else the project's (registry_route). Sent as `stalled <N>m approval_pending <kind>`.
 # Failed sends are retried by later sweeps, three attempts at most. At most 5 sends per run.
 sweep_approvals() {
-  local rows rid tid kind created f key n=0 age tries rc
+  local rows rid tid kind created f key n=0 age tries rc offset=0 page pages=0
   [ "$APPROVAL_MINUTES" -gt 0 ] || return 0
-  rows="$(registry_pending_requests "$((APPROVAL_MINUTES * 60))" 172800)" || return 0
-  [ -n "$rows" ] || return 0
   mkdir -p "$STATE/approvals" 2>/dev/null || return 0
-  while IFS="$REG_US" read -r rid tid kind created; do
-    [ -n "$rid" ] && [ -n "$tid" ] || continue
-    case "$created" in *[!0-9]*|'') continue ;; esac
-    key="$(state_key "$rid")"
-    f="$STATE/approvals/$key"
-    [ ! -f "$f" ] || continue          # once per request: sent, no route or no webhook
-    tries="$(cat "$f.tries" 2>/dev/null)"
-    case "$tries" in *[!0-9]*|'') tries=0 ;; esac
-    [ "$tries" -lt 3 ] || continue
-    [ "$n" -lt 5 ] || break
-    TS="$(date '+%Y-%m-%dT%H:%M:%S%z')"
-    HARNESS=sweep
-    route_reset
-    registry_route "" "$tid"; rc=$?
-    if [ "$rc" -ne 0 ]; then
-      if [ "$rc" -eq 1 ]; then
-        echo "$TS sweep no-route approval thread=$tid kind=$kind" >> "$LOG"
-        printf 'noroute\n' > "$f"
-      else
-        # The lookup failed (T3 busy, thread or ancestor not found): try again on later sweeps.
-        echo "$TS sweep route-lookup-failed approval thread=$tid kind=$kind" >> "$LOG"
-        printf '%s\n' "$((tries + 1))" > "$f.tries"
+  # T3 keeps a handled request pending until its human acts, so the oldest ones come back every time:
+  # read the list a page at a time (up to 10 pages) instead of only its head.
+  while [ "$pages" -lt 10 ]; do
+    rows="$(registry_pending_requests "$((APPROVAL_MINUTES * 60))" 172800 "$offset")" || return 0
+    [ -n "$rows" ] || break
+    page="$(printf '%s\n' "$rows" | wc -l | tr -d ' ')"
+    offset=$((offset + page)); pages=$((pages + 1))
+    while IFS="$REG_US" read -r rid tid kind created; do
+      [ -n "$rid" ] && [ -n "$tid" ] || continue
+      case "$created" in *[!0-9]*|'') continue ;; esac
+      key="$(state_key "$rid")"
+      f="$STATE/approvals/$key"
+      [ ! -f "$f" ] || continue          # once per request: sent, no route or no webhook
+      tries="$(cat "$f.tries" 2>/dev/null)"
+      case "$tries" in *[!0-9]*|'') tries=0 ;; esac
+      [ "$tries" -lt 3 ] || continue
+      # Sends and failed lookups both count: a dead T3 must not keep the sweep lock for minutes.
+      [ "$n" -lt 5 ] || { REG_SNAP_ROOT=; return 0; }
+      TS="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+      HARNESS=sweep
+      route_reset
+      registry_route "" "$tid"; rc=$?
+      if [ "$rc" -ne 0 ]; then
+        if [ "$rc" -eq 1 ]; then
+          echo "$TS sweep no-route approval thread=$tid kind=$kind" >> "$LOG"
+          printf 'noroute\n' > "$f"
+        else
+          # The lookup failed (T3 busy, thread or ancestor not found): try again on later sweeps.
+          echo "$TS sweep route-lookup-failed approval thread=$tid kind=$kind" >> "$LOG"
+          printf '%s\n' "$((tries + 1))" > "$f.tries"
+          n=$((n + 1))
+        fi
+        continue
       fi
-      continue
-    fi
-    n=$((n + 1))
-    age=$(( ($(date +%s) - created) / 60 ))
-    BOT="$ROUTE_BOT"; ROOT="$SUB_ROOT"
-    STATUS="stalled ${age}m approval_pending $kind"
-    LAST=; SESSION=; TRANSCRIPT=; SESSION_CWD=
-    BRANCH="$(git -C "$ROOT" branch --show-current 2>/dev/null)"
-    THREAD_ID="$SUB_ID"; THREAD_TITLE="$SUB_TITLE"; PROJECT_ID=; THREAD_SOURCE=t3db
-    REG_SNAP_ROOT="$ROOT"
-    # Only a thread in another bot's worktree names itself separately from the bot's own threads.
-    case "$ROUTE" in marker|map) SUB_ID=; SUB_TITLE= ;; esac
-    NO_STALL_MARK=1                    # not a worktree stall: leave the status-based stall state alone
-    echo "$TS sweep route=$ROUTE bot=$BOT branch=$BRANCH status=$STATUS thread=$THREAD_ID" >> "$LOG"
-    post; rc=$?
-    NO_STALL_MARK=
-    case "$rc" in
-      0|2) printf '%s\n' "$([ "$rc" = 0 ] && echo sent || echo nowebhook)" > "$f" ;;
-      *) printf '%s\n' "$((tries + 1))" > "$f.tries" ;;
-    esac
-  done <<< "$rows"
+      n=$((n + 1))
+      age=$(( ($(date +%s) - created) / 60 ))
+      BOT="$ROUTE_BOT"; ROOT="$SUB_ROOT"
+      STATUS="stalled ${age}m approval_pending $kind"
+      LAST=; SESSION=; TRANSCRIPT=; SESSION_CWD=
+      BRANCH="$(git -C "$ROOT" branch --show-current 2>/dev/null)"
+      THREAD_ID="$SUB_ID"; THREAD_TITLE="$SUB_TITLE"; PROJECT_ID=; THREAD_SOURCE=t3db
+      REG_SNAP_ROOT="$ROOT"
+      # Only a thread in another bot's worktree names itself separately from the bot's own threads.
+      case "$ROUTE" in marker|map) SUB_ID=; SUB_TITLE= ;; esac
+      NO_STALL_MARK=1                    # not a worktree stall: leave the status-based stall state alone
+      echo "$TS sweep route=$ROUTE bot=$BOT branch=$BRANCH status=$STATUS thread=$THREAD_ID" >> "$LOG"
+      post; rc=$?
+      NO_STALL_MARK=
+      case "$rc" in
+        0|2) printf '%s\n' "$([ "$rc" = 0 ] && echo sent || echo nowebhook)" > "$f" ;;
+        *) printf '%s\n' "$((tries + 1))" > "$f.tries" ;;
+      esac
+    done <<< "$rows"
+    [ "$page" -ge 200 ] || break
+  done
   REG_SNAP_ROOT=
 }
 

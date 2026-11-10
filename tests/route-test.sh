@@ -32,6 +32,7 @@ cat > "$TMP/bin/t3" <<'STUB'
 #!/bin/bash
 echo "$*" >> "$FAKE_T3/cli-calls"
 [ "$1 $2" = "thread show" ] || exit 64
+if [ -f "$FAKE_T3/DOWN" ]; then echo "server not running" >&2; exit 2; fi
 if [ -f "$FAKE_T3/$3.json" ]; then cat "$FAKE_T3/$3.json"; exit 0; fi
 echo "Thread $3 is no longer available." >&2; exit 1
 STUB
@@ -157,6 +158,12 @@ jq -n --arg wt "$WP" '{thread:{threadId:"parent",projectId:"proj-1",title:"Orche
 approve "$WA" builder-a
 count 1
 [ "$(last .route)" = parent ] && [ "$(last .parent_thread_id)" = parent ] || fail "cli fallback: $(tail -n1 "$CALLS")"
+# A dead server trips the same breaker the registry uses, so lookups stop costing 8 seconds each.
+touch "$FAKE_T3/DOWN"
+approve "$WA" builder-a
+count 1                                  # (nothing new was sent; the count is the earlier ping)
+[ -f "$GROKBOT_STATE_DIR/t3cli.fail" ] || fail 'CLI failure did not set the breaker'
+rm -f "$FAKE_T3/DOWN" "$GROKBOT_STATE_DIR/t3cli.fail"
 mv "$GROKBOT_T3_DB.off" "$GROKBOT_T3_DB"
 : > "$CALLS"
 
@@ -251,6 +258,31 @@ count 0
 sweep
 count 1
 [ "$(last .thread_id)" = builder-a ] || fail "after registry back on: $(tail -n1 "$CALLS")"
+
+# --- 9f. More than one page of handled requests must not hide a newer one. ---
+: > "$CALLS"
+sqlite3 "$GROKBOT_T3_DB" "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 210)
+  INSERT INTO orchestration_v2_projection_runtime_requests SELECT 'req-page-'||i, 'builder-b', 'command', 'pending', strftime('%Y-%m-%dT%H:%M:%fZ','now','-'||(2000+i)||' minutes'), NULL FROM n;"
+mkdir -p "$GROKBOT_STATE_DIR/approvals"
+for i in $(seq 1 210); do echo sent > "$GROKBOT_STATE_DIR/approvals/$(printf '%s' "req-page-$i" | shasum -a 256 | awk '{print $1}')"; done
+db_request req-after-pages builder-b command pending 9.5
+db_request req-after-pages2 builder-b command pending 11
+sweep
+count 1
+[ "$(last .status)" = 'stalled 11m approval_pending command' ] || fail "request behind 210 handled ones: $(tail -n1 "$CALLS")"
+
+# --- 9g. The project lookup failing is not a verdict either. ---
+: > "$CALLS"
+db_thread lone2 proj-1 'Another agent thread' "$TMP/lone2" - agent mcp
+db_request req-lone2 lone2 command pending 30
+chmod 000 "$GROKBOT_HOOKS_DIR/threads.sqlite"
+sweep
+chmod 600 "$GROKBOT_HOOKS_DIR/threads.sqlite"
+count 0
+grep -q 'route-lookup-failed approval thread=lone2' "$LOGF" || fail 'registry failure not treated as a failed lookup'
+sweep
+count 1
+[ "$(last .route)" = project ] && [ "$(last .thread_id)" = lone2 ] || fail "lone2 after registry recovered: $(tail -n1 "$CALLS")"
 
 # --- 10. Without registry-lib.sh nothing routes and nothing breaks. ---
 : > "$CALLS"

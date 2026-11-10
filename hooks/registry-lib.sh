@@ -472,7 +472,13 @@ reg_thread_info() {
     cli="${GROKBOT_T3_CLI:-${T3CODE_CLI_PATH:-$HOME/.t3/bin/t3}}"
     [ -x "$cli" ] || return 1
     [ ! -f "$STATE/t3cli.fail" ] || [ -n "$(find "$STATE/t3cli.fail" -mmin "+$((REG_BREAKER_SECONDS / 60))" -print 2>/dev/null)" ] || return 1
-    out="$(reg_timeout 8 "$cli" thread show "$id" --json --messages 0 2>/dev/null </dev/null)" || return 1
+    out="$(reg_timeout 8 "$cli" thread show "$id" --json --messages 0 2>"$STATE/t3err.$$" </dev/null)" || {
+      # A dead server must not cost 8 seconds per lookup: same breaker as reg_verify. "No longer
+      # available" just means this thread is gone.
+      grep -q 'no longer available' "$STATE/t3err.$$" 2>/dev/null || touch "$STATE/t3cli.fail" 2>/dev/null
+      rm -f "$STATE/t3err.$$"; return 1
+    }
+    rm -f "$STATE/t3err.$$"
     out="$(printf '%s' "$out" | "$JQ" -r '.thread | [ .threadId, (.projectId // ""), (.title // ""), (.createdBy // ""),
         (.creationSource // ""), (.parentThreadId // ""), (.worktreePath // ""), ((.archived // false) | if . then 1 else 0 end)
       ] | map(tostring | gsub("[\\x00-\\x1f]"; " ")) | join("\u001f")' 2>/dev/null)"
@@ -532,19 +538,26 @@ registry_route() {
     done
   fi
   # Fallback: an agent-launched thread (not one of your own in the T3 window) in a project with a bot.
-  if [ "${GROKBOT_ROUTE_PROJECT:-1}" != 0 ] && [ -n "$project" ] && [ "$by" = agent ] && [ "$src" = mcp ] && registry_init; then
-    reg_q "$project"
-    b="$(reg_run <<< "SELECT bot FROM threads WHERE project_id=$REG_Q ORDER BY updated_at DESC LIMIT 1;" | tr -cd 'a-z0-9_-')" || b=
-    if [ -n "$b" ] && [ -f "$DIR/$b.env" ]; then ROUTE_BOT="$b"; ROUTE=project; return 0; fi
+  if [ "${GROKBOT_ROUTE_PROJECT:-1}" != 0 ] && [ -n "$project" ] && [ "$by" = agent ] && [ "$src" = mcp ]; then
+    if registry_init; then
+      reg_q "$project"
+      # No pipe after reg_run: its status says whether the query itself worked.
+      b="$(reg_run <<< "SELECT bot FROM threads WHERE project_id=$REG_Q ORDER BY updated_at DESC LIMIT 1;")" || broken=1
+      b="$(printf '%s' "$b" | tr -cd 'a-z0-9_-')"
+      if [ -n "$b" ] && [ -f "$DIR/$b.env" ]; then ROUTE_BOT="$b"; ROUTE=project; return 0; fi
+    else
+      broken=1
+    fi
   fi
   [ "$broken" = 0 ] || return 2
   return 1
 }
 
-# registry_pending_requests <min age s> <max age s>: one line per request that T3 still holds as
+# registry_pending_requests <min age s> <max age s> [offset]: one line per request that T3 still holds as
 # pending (an approval or a question waiting for a human) for its open threads, oldest first, at most
-# 200 (the caller skips the ones it has handled already): request id, thread id, kind (command, file_change, user_input, ...), created time in epoch seconds.
+# 200 per page, from [offset] on (the caller pages through, skipping what it has handled): request id, thread id, kind (command, file_change, user_input, ...), created time in epoch seconds.
 registry_pending_requests() {
+  local offset="${3:-0}"
   reg_on || return 1
   reg_t3_query "SELECT r.runtime_request_id, r.thread_id, r.kind, CAST(strftime('%s', r.created_at) AS INTEGER)
     FROM orchestration_v2_projection_runtime_requests r
@@ -552,7 +565,7 @@ registry_pending_requests() {
     WHERE r.status = 'pending' AND t.deleted_at IS NULL AND t.archived_at IS NULL
       AND CAST(strftime('%s', r.created_at) AS INTEGER) <= CAST(strftime('%s', 'now') AS INTEGER) - $1
       AND CAST(strftime('%s', r.created_at) AS INTEGER) >= CAST(strftime('%s', 'now') AS INTEGER) - $2
-    ORDER BY r.created_at LIMIT 200;"
+    ORDER BY r.created_at LIMIT 200 OFFSET ${offset//[!0-9]/};"
 }
 
 # registry_summary <bot>: sets SUMMARY_JSON (a JSON array of at most GROKBOT_SUMMARY_MAX strings
