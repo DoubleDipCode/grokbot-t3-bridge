@@ -41,3 +41,13 @@
 # database for the read-only worktree lookup used for Codex threads. Set the second to 0 to never read it.
 # GROKBOT_T3_CLI=~/.t3/bin/t3
 # GROKBOT_T3_DB_LOOKUP=1
+
+# A prompt in a thread with no .grokbot marker (a thread your bot delegated, or launched without the
+# brief footer) is routed to the bot of its parent thread, then to its project's bot. Set to 0 to turn
+# either route off.
+# GROKBOT_ROUTE_PARENT=1
+# GROKBOT_ROUTE_PROJECT=1
+
+# Minutes a request may wait in T3 (an approval prompt or a question) before the sweep pings once
+# for it (default 10; 0 turns this off).
+# GROKBOT_APPROVAL_MINUTES=10

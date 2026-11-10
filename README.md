@@ -92,12 +92,14 @@ ONE-SHOT-PROMPT.md        paste-in prompt for building your own version from scr
 install.sh                installs the hooks for Codex and every Claude config dir (idempotent)
 uninstall.sh              removes the hook entries again
 hooks/config-lib.sh       shared parser for the optional config file and Claude dir detection
-hooks/notify.sh           Stop hook, turn-start hook, approval-prompt pings and sweep: reads marker + status, POSTs to the bot
-hooks/registry-lib.sh     thread registry (threads.sqlite): finds the T3 thread for each worktree, builds my_open_threads
+hooks/notify.sh           Stop hook, turn-start hook, approval-prompt pings and sweeps: reads marker + status, POSTs to the bot
+hooks/registry-lib.sh     thread registry (threads.sqlite): finds the T3 thread for each worktree, builds my_open_threads,
+                          routes marker-less sub-threads to their parent's bot, lists T3's pending approvals
 hooks/set-webhook.sh      stores one bot's webhook URL + auth in a chmod 600 file
 examples/config.example   optional local config (copy to ~/.grokbot-hooks/config)
 docs/t3-mcp-setup.md      connecting T3 Code's MCP to Grok Bot, and the tools bots use
 docs/hooks.md             hook config per harness, payload schema, debugging
+docs/approval-prompts.md  why Claude Code asks for approval on harmless commands, and the options for fewer prompts
 docs/t3.md                T3 path and existing workflow links
 docs/claude-code.md       plain Claude Code setup and resume
 docs/codex-cli.md         plain Codex CLI setup and resume
@@ -113,6 +115,7 @@ templates/brief-footer.md     text to append to every brief sent to T3
 Each callback names the T3 thread it belongs to. The hook finds it from the `T3CODE_THREAD_ID` environment variable that T3 sets for Claude Code sessions, or for Codex from a read-only lookup of the worktree path in T3's database, and checks it with `t3 thread show`. It keeps one row per worktree in `~/.grokbot-hooks/threads.sqlite` and adds these fields to the payload:
 
 - `thread_id`, `thread_title`, `project_id`, `thread_source`
+- `route`, `sub_thread_id`, `sub_thread_title`, `parent_thread_id`, `parent_thread_title`, `parent_worktree`: how the ping found its bot (`marker`, `map`, `parent`, `project`) and, for a routed sub-thread, which thread needs attention and which parent it belongs to (see [below](#delegated-sub-threads-and-t3s-own-list-of-pending-approvals))
 - `my_open_threads`: up to 8 short lines `id|status|branch|title` for that bot's open threads (`done` ones until T3 settles or archives them, and `worktree_missing`), plus `my_open_threads_more`
 
 So the routine can go straight to `t3_thread_read` with `thread_id` and answer "which of my threads are open" from the payload, with no `t3_thread_list` or `t3_thread_search`. Nobody writes registry entries by hand. Old payload fields are unchanged. Details, fallbacks and risks (the Codex lookup reads T3's internal storage): [docs/hooks.md](docs/hooks.md#thread-registry).
@@ -127,6 +130,18 @@ A thread blocked on a permission prompt has not ended its turn, so Stop never fi
 `install.sh` registers them: `Notification` in every Claude config dir it finds (see [Configuration](#configuration)) and `PermissionRequest` in `~/.codex/hooks.json`. It also registers the `UserPromptSubmit` turn-start hooks for [dead turns](#dead-turns); like every Codex hook, the Codex one must be trusted in `/hooks`. These pings always send (no dedupe) and never touch `.grokbot-status`. A bot cannot answer the prompt; it should tell the human.
 
 As a fallback, the sweep sends `stalled <N>m approval? <status>` when a harness is running in a marked worktree but nothing has changed for `GROKBOT_STALL_MINUTES` (default 45). Details: [docs/hooks.md](docs/hooks.md#approval-prompt-pings).
+
+### Delegated sub-threads and T3's own list of pending approvals
+
+A builder that a bot's thread starts with `delegate_task` (or any thread a bot launches without writing `.grokbot`) has no marker, so the hooks above used to log `no-marker` and stay silent. Two things close that gap:
+
+- **Routing.** An approval ping from a worktree with no marker asks T3 who the thread's parent is (`lineage.parentThreadId`, the same value `t3 thread show --json` calls `parentThreadId`) and walks up to the first ancestor whose worktree has a `.grokbot` marker (or whose thread id the registry already knows). That ancestor's bot gets the ping, with `route: "parent"`, `sub_thread_id`, `sub_thread_title` and `parent_thread_id`. A thread that an agent launched over MCP and that has no bot-owned ancestor goes to the bot that last worked in the same T3 project (`route: "project"`). Threads you start yourself in the T3 window never take that fallback. Turn off with `GROKBOT_ROUTE_PARENT=0` / `GROKBOT_ROUTE_PROJECT=0`.
+- **Pending approvals sweep.** T3 itself keeps every approval prompt and question that is still waiting for a human. The sweep reads that list (read-only) and pings once per request for anything older than `GROKBOT_APPROVAL_MINUTES` (default 10), as `stalled <N>m approval_pending <kind>`, for marked threads and routed sub-threads alike. This also catches a prompt that no hook reported. It sends at most 5 pings per run and retries a failed send or lookup twice. `GROKBOT_REGISTRY=0` turns both off.
+
+Stop and dead-turn pings are unchanged and still need the marker: a sub-thread's turn ending is reported to its parent thread by T3 itself. Details and risks (T3's database is internal storage): [docs/hooks.md](docs/hooks.md#routing-for-marker-less-threads-and-the-pending-approvals-sweep).
+
+If your threads keep stopping on approval prompts for harmless commands, see [docs/approval-prompts.md](docs/approval-prompts.md).
+
 
 ## Dead turns
 
@@ -148,6 +163,7 @@ The first word of `.grokbot-status` controls delivery:
 | `stalled <N>m turn_died <last status>` | Sweep alert: a turn started (turn-start hook) but never ended (no Stop), and no harness is left in the worktree, for at least 45 minutes. Sent whatever the old status was, `done` and `waiting` included, once per dead turn. Treat it like `failed`. See [dead turns](#dead-turns). |
 | `stalled <N>m approval? <original status>` | Sweep alert when a harness *is* running but nothing has changed for N minutes; it may be blocked on an approval prompt. See [the stall fallback](docs/hooks.md#stall-fallback-in-the-sweep). |
 | `needs_input approval ...` | Not a status-file value: the approval hooks send it mid-turn. Always sent, no dedupe, status file untouched. |
+| `stalled <N>m approval_pending <kind>` | Sweep alert from T3's own list: a request (`command`, `user_input`, ...) has waited N minutes (at least `GROKBOT_APPROVAL_MINUTES`) for a human. Once per request. |
 | Any other word | Send for compatibility. This includes `continuing`, `turn_ended_no_status`, and `worktree_missing`. |
 
 Except for `needs_input` and `failed`, a status identical to the last successful
@@ -215,7 +231,8 @@ Run `python3 tests/notify-http-test.py` for local HTTP payload tests for all thr
 Run `bash tests/install-test.sh` for the installer and uninstaller against a temporary HOME.
 Run `bash tests/stall-test.sh` for stall watchdog cases.
 Run `bash tests/turn-start-test.sh` for the turn-start hook and dead-turn cases.
-Run `bash tests/notify-test.sh` (and `tests/registry-test.sh`, `tests/stall-test.sh`, `tests/turn-start-test.sh`, `tests/install-test.sh`, `python3 tests/notify-http-test.py`) for isolated tests with a stub curl. The tests
+Run `bash tests/route-test.sh` for sub-thread routing and the pending-approvals sweep.
+Run `bash tests/notify-test.sh` (and `tests/registry-test.sh`, `tests/route-test.sh`, `tests/stall-test.sh`, `tests/turn-start-test.sh`, `tests/install-test.sh`, `python3 tests/notify-http-test.py`) for isolated tests with a stub curl. The tests
 use temporary HOME, hooks, and state directories and make no real HTTP requests.
 
 ## Configuration
@@ -232,7 +249,9 @@ Everything works with no configuration. To change a default, copy [examples/conf
 | `GROKBOT_REGISTRY` | `0` turns the thread registry and the payload thread fields off. |
 | `GROKBOT_SUMMARY_MAX` | Lines in `my_open_threads` (default `8`, `0` leaves it empty). |
 | `GROKBOT_T3_CLI` | The `t3` command used to check threads (default `$T3CODE_CLI_PATH`, then `~/.t3/bin/t3`). |
-| `GROKBOT_T3_DB`, `GROKBOT_T3_DB_LOOKUP` | T3's state database for the Codex lookup; `GROKBOT_T3_DB_LOOKUP=0` never reads it. |
+| `GROKBOT_T3_DB`, `GROKBOT_T3_DB_LOOKUP` | T3's state database for the Codex lookup, the sub-thread routing and the pending-approvals sweep; `GROKBOT_T3_DB_LOOKUP=0` never reads it. |
+| `GROKBOT_ROUTE_PARENT`, `GROKBOT_ROUTE_PROJECT` | `0` turns off routing a marker-less thread to its parent thread's bot, or to its project's bot. |
+| `GROKBOT_APPROVAL_MINUTES` | Minutes a request may wait in T3 before the sweep pings (default `10`, `0` turns the sweep part off). |
 
 Precedence: a real (non-empty) environment variable, then the config file, then the default. `notify.sh`, including `--sweep` under launchd, `install.sh` and `uninstall.sh` all read it.
 
@@ -242,7 +261,7 @@ Precedence: a real (non-empty) environment variable, then the config file, then 
 
 **Harness-agnostic.** There is one script. Each harness gets one config line that calls it with its own name (`notify.sh codex`, `notify.sh claude`). Adding another harness that has a turn-end hook means adding one more line, not another script.
 
-**Opt-in per worktree.** The script does nothing unless the worktree root contains a `.grokbot` file. Bots write that file as the first step of a brief. Your own Codex or Claude Code sessions never have it, so they never trigger anything. The marker is excluded through the repo's `info/exclude`, so it never shows up in `git status` or gets committed.
+**Opt-in per worktree.** The script does nothing unless the worktree root contains a `.grokbot` file. The one exception is an approval prompt (or a pending approval in T3) in a thread that a bot's own thread delegated or launched: it is routed to that bot, because a blocked thread cannot write its own marker. Bots write that file as the first step of a brief. Your own Codex or Claude Code sessions never have it, so they never trigger anything. The marker is excluded through the repo's `info/exclude`, so it never shows up in `git status` or gets committed.
 
 **The agent writes its status to a file.** Before ending each turn the agent overwrites `.grokbot-status` with a status word and a short note. The script reads that file. It does not parse harness transcripts, which differ between harnesses and change between versions.
 
