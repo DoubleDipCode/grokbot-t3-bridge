@@ -458,9 +458,12 @@ reg_thread_info() {
   else
     return 1
   fi
-  out="$(reg_t3_query "SELECT thread_id, COALESCE(project_id,''), COALESCE(title,''),
+  # Free text (title, path) loses its newlines and separator characters in SQL: the rows below are
+  # read line by line, and a title with a line break must not cut off the fields after it.
+  out="$(reg_t3_query "SELECT thread_id, COALESCE(project_id,''), replace(replace(replace(COALESCE(title,''),char(10),' '),char(13),' '),char(31),' '),
       COALESCE(json_extract(payload_json,'\$.createdBy'),''), COALESCE(json_extract(payload_json,'\$.creationSource'),''),
-      COALESCE(json_extract(payload_json,'\$.lineage.parentThreadId'),''), COALESCE(json_extract(payload_json,'\$.worktreePath'),''),
+      COALESCE(json_extract(payload_json,'\$.lineage.parentThreadId'),''),
+      replace(replace(replace(COALESCE(json_extract(payload_json,'\$.worktreePath'),''),char(10),' '),char(13),' '),char(31),' '),
       (archived_at IS NOT NULL)
     FROM orchestration_v2_projection_threads
     WHERE deleted_at IS NULL AND $cond ORDER BY (archived_at IS NULL) DESC, updated_at DESC LIMIT 1;" | head -n1)"
@@ -495,13 +498,15 @@ reg_bot_by_thread() {
 # Sets ROUTE_BOT, ROUTE (marker|map: the thread's own worktree after all; parent: an ancestor's bot;
 # project: the project's bot) and SUB_ID SUB_TITLE SUB_ROOT (the thread that needs attention) plus
 # PARENT_ID PARENT_TITLE PARENT_ROOT (the ancestor that owns the bot, parent route only).
-# Returns 1 when there is no bot. The thread id is the hook's T3CODE_THREAD_ID when there is one, else
+# Returns 1 when there is no bot, 2 when the lookup itself failed or came up short (thread or an
+# ancestor not found: T3 busy or its data changed), which a caller may retry. The thread id is the hook's T3CODE_THREAD_ID when there is one, else
 # the thread is found by worktree path.
 registry_route() {
-  local root="$1" env_id="${2:-}" cur depth=0 seen=" " project by src b
+  local root="$1" env_id="${2:-}" cur depth=0 seen=" " project by src b broken=0
   ROUTE_BOT=; ROUTE=; SUB_ID=; SUB_TITLE=; SUB_ROOT=; PARENT_ID=; PARENT_TITLE=; PARENT_ROOT=
+  reg_on || return 1     # GROKBOT_REGISTRY=0 also keeps thread ids and titles out of these pings
   if [ -n "$env_id" ] && reg_thread_info "$env_id" "$root"; then :
-  elif ! reg_thread_info "" "$root"; then return 1; fi
+  elif ! reg_thread_info "" "$root"; then return 2; fi
   SUB_ID="$TI_ID"; SUB_TITLE="$TI_TITLE"; SUB_ROOT="${TI_WT:-$root}"; project="$TI_PROJECT"; by="$TI_BY"; src="$TI_SOURCE"
   cur="$TI_PARENT"
   # The thread's own worktree may carry a marker (a sweep asking about a marked worktree).
@@ -515,6 +520,7 @@ registry_route() {
         if b="$(reg_bot_by_thread "$cur")"; then
           ROUTE_BOT="$b"; ROUTE=parent; PARENT_ID="$cur"; return 0
         fi
+        broken=1   # may be a failed lookup rather than a deleted thread: callers may retry
         break
       fi
       if reg_wt_bot "$TI_WT"; then b="$WT_BOT"; else b="$(reg_bot_by_thread "$TI_ID")" || b=; fi
@@ -531,20 +537,22 @@ registry_route() {
     b="$(reg_run <<< "SELECT bot FROM threads WHERE project_id=$REG_Q ORDER BY updated_at DESC LIMIT 1;" | tr -cd 'a-z0-9_-')" || b=
     if [ -n "$b" ] && [ -f "$DIR/$b.env" ]; then ROUTE_BOT="$b"; ROUTE=project; return 0; fi
   fi
+  [ "$broken" = 0 ] || return 2
   return 1
 }
 
 # registry_pending_requests <min age s> <max age s>: one line per request that T3 still holds as
 # pending (an approval or a question waiting for a human) for its open threads, oldest first, at most
-# 20: request id, thread id, kind (command, file_change, user_input, ...), created time in epoch seconds.
+# 200 (the caller skips the ones it has handled already): request id, thread id, kind (command, file_change, user_input, ...), created time in epoch seconds.
 registry_pending_requests() {
+  reg_on || return 1
   reg_t3_query "SELECT r.runtime_request_id, r.thread_id, r.kind, CAST(strftime('%s', r.created_at) AS INTEGER)
     FROM orchestration_v2_projection_runtime_requests r
     JOIN orchestration_v2_projection_threads t ON t.thread_id = r.thread_id
     WHERE r.status = 'pending' AND t.deleted_at IS NULL AND t.archived_at IS NULL
       AND CAST(strftime('%s', r.created_at) AS INTEGER) <= CAST(strftime('%s', 'now') AS INTEGER) - $1
       AND CAST(strftime('%s', r.created_at) AS INTEGER) >= CAST(strftime('%s', 'now') AS INTEGER) - $2
-    ORDER BY r.created_at LIMIT 20;"
+    ORDER BY r.created_at LIMIT 200;"
 }
 
 # registry_summary <bot>: sets SUMMARY_JSON (a JSON array of at most GROKBOT_SUMMARY_MAX strings

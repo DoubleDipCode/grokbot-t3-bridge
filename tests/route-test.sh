@@ -210,6 +210,48 @@ sweep
 count 1                                                 # req-off now goes; the archived thread's does not
 [ "$(last .thread_id)" = builder-a ] || fail "archived: $(tail -n1 "$CALLS")"
 
+# --- 9b. More pending requests than one query returns or one run sends: all get through, 5 per run. ---
+: > "$CALLS"
+for i in $(seq 1 25); do db_request "req-many-$i" builder-b command pending "$((100 + i))"; done
+sweep; count 5
+sweep; sweep; sweep; sweep
+count 25
+sweep; count 25
+
+# --- 9c. A failed lookup is not a verdict: retried (bounded), and routed once T3 knows the ancestor. ---
+: > "$CALLS"
+db_thread orphan proj-1 'Orphan' "$TMP/orphan" ghost user web
+db_request req-orphan orphan command pending 30
+sweep
+count 0
+grep -q 'route-lookup-failed approval thread=orphan' "$LOGF" || fail 'failed lookup not logged'
+[ ! -f "$GROKBOT_STATE_DIR/approvals/$(printf '%s' req-orphan | shasum -a 256 | awk '{print $1}')" ] || fail 'failed lookup was made final'
+db_thread ghost proj-1 'Ghost orchestrator' "$WP" -
+sweep
+count 1
+[ "$(last .thread_id)" = orphan ] && [ "$(last .parent_thread_id)" = ghost ] || fail "orphan after ancestor appeared: $(tail -n1 "$CALLS")"
+
+# --- 9d. Titles with line breaks and separator characters keep their fields intact. ---
+: > "$CALLS"
+sqlite3 "$GROKBOT_T3_DB" "INSERT INTO orchestration_v2_projection_threads VALUES('multi','proj-1','Line one'||char(10)||'line two'||char(31)||'x','2026-11-10T10:00:00Z',NULL,NULL,
+  json('{\"worktreePath\":\"$TMP/multi\",\"createdBy\":\"agent\",\"creationSource\":\"mcp\",\"lineage\":{\"parentThreadId\":\"multip\"}}'));
+  INSERT INTO orchestration_v2_projection_threads VALUES('multip','proj-1','Parent'||char(10)||'multi','2026-11-10T10:00:00Z',NULL,NULL,
+  json('{\"worktreePath\":\"$WP\",\"createdBy\":\"agent\",\"creationSource\":\"mcp\",\"lineage\":{\"parentThreadId\":null}}'));"
+approve "$TMP/multi" multi
+count 1
+[ "$(last .route)" = parent ] && [ "$(last .parent_thread_id)" = multip ] && [ "$(last .parent_worktree)" = "$WP" ] || fail "multiline titles: $(tail -n1 "$CALLS")"
+[ "$(last .sub_thread_title)" = 'Line one line two x' ] && [ "$(last .parent_thread_title)" = 'Parent multi' ] || fail "multiline title text: $(last .sub_thread_title) / $(last .parent_thread_title)"
+
+# --- 9e. GROKBOT_REGISTRY=0 turns routing and the approvals sweep off: no thread ids leave the machine. ---
+: > "$CALLS"
+db_request req-regoff builder-a command pending 40
+GROKBOT_REGISTRY=0 approve "$WA" builder-a
+GROKBOT_REGISTRY=0 sweep
+count 0
+sweep
+count 1
+[ "$(last .thread_id)" = builder-a ] || fail "after registry back on: $(tail -n1 "$CALLS")"
+
 # --- 10. Without registry-lib.sh nothing routes and nothing breaks. ---
 : > "$CALLS"
 mv "$GROKBOT_HOOKS_DIR/registry-lib.sh" "$GROKBOT_HOOKS_DIR/registry-lib.sh.off"

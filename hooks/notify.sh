@@ -438,9 +438,16 @@ sweep_approvals() {
     TS="$(date '+%Y-%m-%dT%H:%M:%S%z')"
     HARNESS=sweep
     route_reset
-    if ! registry_route "" "$tid"; then
-      echo "$TS sweep no-route approval thread=$tid kind=$kind" >> "$LOG"
-      printf 'noroute\n' > "$f"
+    registry_route "" "$tid"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+      if [ "$rc" -eq 1 ]; then
+        echo "$TS sweep no-route approval thread=$tid kind=$kind" >> "$LOG"
+        printf 'noroute\n' > "$f"
+      else
+        # The lookup failed (T3 busy, thread or ancestor not found): try again on later sweeps.
+        echo "$TS sweep route-lookup-failed approval thread=$tid kind=$kind" >> "$LOG"
+        printf '%s\n' "$((tries + 1))" > "$f.tries"
+      fi
       continue
     fi
     n=$((n + 1))
