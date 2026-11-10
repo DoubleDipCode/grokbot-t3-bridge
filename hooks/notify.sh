@@ -1,6 +1,7 @@
 #!/bin/bash
 # shellcheck disable=SC2016 # Single-quoted expressions are jq programs.
-# Actionable Stop notifications, approval-prompt pings (claude-notify, codex-permission),
+# Actionable Stop notifications, approval-prompt pings (claude-notify, codex-permission; an unmarked
+# sub-thread is routed to its parent thread's bot), a sweep over T3's pending approvals,
 # turn-start bookkeeping (claude-start, codex-start; sends nothing) and --sweep, which checks saved
 # worktrees for stalls (a dead turn, no harness, or a running harness gone quiet).
 HARNESS="${1:-unknown}"
@@ -16,6 +17,10 @@ STALE="${GROKBOT_STALE_SECONDS:-7200}"
 case "$STALE" in *[!0-9]*|'') STALE=7200 ;; esac
 STALL_MINUTES="${GROKBOT_STALL_MINUTES:-45}"
 case "$STALL_MINUTES" in *[!0-9]*|'') STALL_MINUTES=45 ;; esac
+# Minutes a request may wait in T3 (a pending approval or question) before the sweep pings. 0 = never.
+APPROVAL_MINUTES="${GROKBOT_APPROVAL_MINUTES:-10}"
+case "$APPROVAL_MINUTES" in *[!0-9]*|'') APPROVAL_MINUTES=10 ;; esac
+APPROVAL_MINUTES=$((10#$APPROVAL_MINUTES))
 LOG="$DIR/notify.log"
 MAP="$DIR/markers.tsv"   # worktree<TAB>bot, so a removed or switched worktree can still be reported
 umask 077                # anything this script creates (log, map) is private to the user
@@ -40,6 +45,7 @@ if ! type registry_record >/dev/null 2>&1; then
   registry_record() { :; }; registry_resolve() { :; }; registry_refresh() { :; }
   registry_load_thread() { THREAD_ID=; THREAD_TITLE=; PROJECT_ID=; THREAD_SOURCE=; }
   registry_summary() { SUMMARY_JSON='[]'; SUMMARY_MORE=0; }
+  registry_route() { return 1; }; registry_pending_requests() { :; }
 fi
 
 # Keep the log bounded: one rotation at about 1 MB. no-marker lines are logged on every
@@ -48,8 +54,14 @@ if [ -f "$LOG" ] && [ "$(wc -c < "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; t
   mv -f "$LOG" "$LOG.1" 2>/dev/null
 fi
 
+# route_reset: clear how the current ping was routed (ROUTE: marker, map, parent or project) and the
+# sub-thread/parent fields that only a routed ping has.
+route_reset() {
+  ROUTE=; ROUTE_BOT=; SUB_ID=; SUB_TITLE=; SUB_ROOT=; PARENT_ID=; PARENT_TITLE=; PARENT_ROOT=
+}
+
 # post: POST the payload built from the globals BOT ROOT HARNESS BRANCH STATUS LAST TS SESSION
-# TRANSCRIPT SESSION_CWD, plus the registry's thread fields. Returns 0 on HTTP 2xx, 1 on failure, 2 when the bot has no webhook.
+# TRANSCRIPT SESSION_CWD ROUTE SUB_* PARENT_*, plus the registry's thread fields. Returns 0 on HTTP 2xx, 1 on failure, 2 when the bot has no webhook.
 post() {
   local env="$DIR/$BOT.env" body http result
   [ -f "$env" ] || return 2
@@ -64,11 +76,13 @@ post() {
     --arg branch "$BRANCH" --arg status "$STATUS" --arg last "$LAST" --arg ts "$TS" \
     --arg session "$SESSION" --arg transcript "$TRANSCRIPT" --arg cwd "$SESSION_CWD" \
     --arg thread_id "${THREAD_ID:-}" --arg thread_title "${THREAD_TITLE:-}" --arg project_id "${PROJECT_ID:-}" \
-    --arg thread_source "${THREAD_SOURCE:-}" --argjson open_threads "${SUMMARY_JSON:-[]}" --argjson open_more "${SUMMARY_MORE:-0}" \
-    '{event:"t3_turn_ended",bot:$bot,harness:$harness,worktree:$worktree,branch:$branch,status:$status,last_message:$last,ended_at:$ts,cwd:$cwd,session_id:$session,transcript_path:$transcript,thread_id:$thread_id,thread_title:$thread_title,project_id:$project_id,thread_source:$thread_source,my_open_threads:$open_threads,my_open_threads_more:$open_more}')" || return 1
+    --arg thread_source "${THREAD_SOURCE:-}" --arg route "${ROUTE:-}" --arg sub_thread_id "${SUB_ID:-}" --arg sub_thread_title "${SUB_TITLE:-}" \
+    --arg parent_thread_id "${PARENT_ID:-}" --arg parent_thread_title "${PARENT_TITLE:-}" --arg parent_worktree "${PARENT_ROOT:-}" \
+    --argjson open_threads "${SUMMARY_JSON:-[]}" --argjson open_more "${SUMMARY_MORE:-0}" \
+    '{event:"t3_turn_ended",bot:$bot,harness:$harness,worktree:$worktree,branch:$branch,status:$status,last_message:$last,ended_at:$ts,cwd:$cwd,session_id:$session,transcript_path:$transcript,thread_id:$thread_id,thread_title:$thread_title,project_id:$project_id,thread_source:$thread_source,route:$route,sub_thread_id:$sub_thread_id,sub_thread_title:$sub_thread_title,parent_thread_id:$parent_thread_id,parent_thread_title:$parent_thread_title,parent_worktree:$parent_worktree,my_open_threads:$open_threads,my_open_threads_more:$open_more}')" || return 1
   # Record stall attempts only once a payload and webhook are available.
   # At most one request per revision, even on HTTP failure or worker crash.
-  if [ "$HARNESS" = sweep ] && [[ "$STATUS" = stalled\ * ]]; then
+  if [ "$HARNESS" = sweep ] && [[ "$STATUS" = stalled\ * ]] && [ -z "${NO_STALL_MARK:-}" ]; then
     touch "$STATE/$KEY.stalled" || return 1
     # A dead turn is reported once per turn start, whatever happens to the status file.
     [ -z "${TURN_DEAD:-}" ] || write_epoch "$STATE/$KEY.turndead" "$TURN_START" || return 1
@@ -163,9 +177,12 @@ TRANSCRIPT="${5:-}"
 SESSION_CWD="${6:-}"
 TS="$(date '+%Y-%m-%dT%H:%M:%S%z')"
 NOW="$(date +%s)"
+route_reset
+NO_STALL_MARK=
 if [ -f "$ROOT/.grokbot" ]; then
   # Bot name is sanitised so it can only ever point at a file inside $DIR.
   BOT="$(head -n1 "$ROOT/.grokbot" | tr -cd 'a-z0-9_-')"
+  ROUTE=marker
   ensure_marker "$ROOT" "$BOT"
   STATUS_FILE="$ROOT/.grokbot-status"
   # Sentinel preserves trailing newlines for byte-exact dedupe of the payload.
@@ -180,6 +197,7 @@ else
     echo "$TS $HARNESS no-marker $ROOT" >> "$LOG"
     return 0
   fi
+  ROUTE=map
   STATUS="worktree_missing worktree $ROOT no longer has a .grokbot marker (deleted or moved); read the thread for its real state"
 fi
 
@@ -395,6 +413,58 @@ sweep() {
   done < "$MAP"
 }
 
+# sweep_approvals: T3 knows every request that is waiting for a human (an approval prompt or a
+# question). Any such request older than GROKBOT_APPROVAL_MINUTES (default 10) gets one ping per
+# request, so a prompt that no hook reported (hook not registered, marker missing, harness not
+# running the hook) is still noticed. The bot comes from the thread's own marker, else its parent
+# thread's, else the project's (registry_route). Sent as `stalled <N>m approval_pending <kind>`.
+# Failed sends are retried by later sweeps, three attempts at most. At most 5 sends per run.
+sweep_approvals() {
+  local rows rid tid kind created f key n=0 age tries rc
+  [ "$APPROVAL_MINUTES" -gt 0 ] || return 0
+  rows="$(registry_pending_requests "$((APPROVAL_MINUTES * 60))" 172800)" || return 0
+  [ -n "$rows" ] || return 0
+  mkdir -p "$STATE/approvals" 2>/dev/null || return 0
+  while IFS="$REG_US" read -r rid tid kind created; do
+    [ -n "$rid" ] && [ -n "$tid" ] || continue
+    case "$created" in *[!0-9]*|'') continue ;; esac
+    key="$(state_key "$rid")"
+    f="$STATE/approvals/$key"
+    [ ! -f "$f" ] || continue          # once per request: sent, no route or no webhook
+    tries="$(cat "$f.tries" 2>/dev/null)"
+    case "$tries" in *[!0-9]*|'') tries=0 ;; esac
+    [ "$tries" -lt 3 ] || continue
+    [ "$n" -lt 5 ] || break
+    TS="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    HARNESS=sweep
+    route_reset
+    if ! registry_route "" "$tid"; then
+      echo "$TS sweep no-route approval thread=$tid kind=$kind" >> "$LOG"
+      printf 'noroute\n' > "$f"
+      continue
+    fi
+    n=$((n + 1))
+    age=$(( ($(date +%s) - created) / 60 ))
+    BOT="$ROUTE_BOT"; ROOT="$SUB_ROOT"
+    STATUS="stalled ${age}m approval_pending $kind"
+    LAST=; SESSION=; TRANSCRIPT=; SESSION_CWD=
+    BRANCH="$(git -C "$ROOT" branch --show-current 2>/dev/null)"
+    THREAD_ID="$SUB_ID"; THREAD_TITLE="$SUB_TITLE"; PROJECT_ID=; THREAD_SOURCE=t3db
+    REG_SNAP_ROOT="$ROOT"
+    # Only a thread in another bot's worktree names itself separately from the bot's own threads.
+    case "$ROUTE" in marker|map) SUB_ID=; SUB_TITLE= ;; esac
+    NO_STALL_MARK=1                    # not a worktree stall: leave the status-based stall state alone
+    echo "$TS sweep route=$ROUTE bot=$BOT branch=$BRANCH status=$STATUS thread=$THREAD_ID" >> "$LOG"
+    post; rc=$?
+    NO_STALL_MARK=
+    case "$rc" in
+      0|2) printf '%s\n' "$([ "$rc" = 0 ] && echo sent || echo nowebhook)" > "$f" ;;
+      *) printf '%s\n' "$((tries + 1))" > "$f.tries" ;;
+    esac
+  done <<< "$rows"
+  REG_SNAP_ROOT=
+}
+
 worker() {
   local mode="$HARNESS"   # process() overwrites HARNESS, so remember whether this is the launchd sweep
   case "$mode" in
@@ -408,6 +478,7 @@ worker() {
   adopt_pending
   [ -z "$CURRENT" ] || process "$CURRENT" "$HARNESS" "$MESSAGE" "$SESSION_ID" "$TRANSCRIPT_PATH" "$CWD"
   [ ! -f "$MAP" ] || sweep
+  sweep_approvals
   # Registry upkeep (look up missing thread ids, re-check old rows, prune). Small batches per hook,
   # bigger ones for the launchd sweep. Skipped when nothing was ever recorded.
   if [ -f "$REG_DB" ] || [ -f "$MAP" ]; then
@@ -478,11 +549,13 @@ approval_summary() {
 }
 
 approval() {
-  local d top root bot
+  local d top root bot routed=
   approval_summary || exit 0
   d="$(cd "$CWD" 2>/dev/null && pwd -P || echo "$CWD")"
   top="$(git -C "$d" rev-parse --show-toplevel 2>/dev/null || echo "$d")"
   root=
+  route_reset
+  NO_STALL_MARK=
   while :; do
     [ -f "$d/.grokbot" ] && { root="$d"; break; }
     [ "$d" = "$top" ] || [ "$d" = / ] || [ "$d" = . ] && break
@@ -491,14 +564,23 @@ approval() {
   TS="$(date '+%Y-%m-%dT%H:%M:%S%z')"
   if [ -n "$root" ]; then
     bot="$(head -n1 "$root/.grokbot" | tr -cd 'a-z0-9_-')"
+    ROUTE=marker
   else
     # Marker removed with the worktree: fall back to the marker map, as Stop does.
     root="$top"
     bot="$(awk -F'\t' -v r="$root" '$1==r {b=$2} END{print b}' "$MAP" 2>/dev/null | tr -cd 'a-z0-9_-')"
+    [ -z "$bot" ] || ROUTE=map
   fi
   if [ -z "$bot" ]; then
-    echo "$TS $HARNESS no-marker $top" >> "$LOG"
-    exit 0
+    # No marker at all. A sub-thread that a bot's thread delegated never got one: ask T3 who its
+    # parent is and use that thread's bot (or the project's bot for an agent-launched thread).
+    if registry_route "$root" "$REG_ENV_THREAD"; then
+      bot="$ROUTE_BOT"; routed=1
+      echo "$TS $HARNESS route=$ROUTE bot=$bot sub=${SUB_ID:-none} parent=${PARENT_ID:-none} $root" >> "$LOG"
+    else
+      echo "$TS $HARNESS no-marker $top" >> "$LOG"
+      exit 0
+    fi
   fi
   BOT="$bot"
   ROOT="$root"
@@ -506,14 +588,20 @@ approval() {
   TRANSCRIPT="$TRANSCRIPT_PATH"
   SESSION_CWD="$CWD"
   LAST="$MESSAGE"
-  # Registry: keep the thread row current, using the status file as it is (this ping does not
-  # change it). A first event for a worktree may be an approval prompt, so this can create the row.
-  STATUS="$( { [ -f "$ROOT/.grokbot-status" ] && head -c 2000 "$ROOT/.grokbot-status" || printf turn_ended_no_status; }; printf '.')"
-  STATUS="${STATUS%.}"
-  WORD="$(printf '%s' "$STATUS" | awk 'NR==1 {print $1}')"
-  registry_record approval
-  registry_resolve "$ROOT" "$REG_ENV_THREAD"
   BRANCH="$(git -C "$ROOT" branch --show-current 2>/dev/null)"
+  if [ -n "$routed" ]; then
+    # Not this bot's worktree: no registry row for it. The payload names the sub-thread instead.
+    THREAD_ID="$SUB_ID"; THREAD_TITLE="$SUB_TITLE"; PROJECT_ID=; THREAD_SOURCE=t3db
+    REG_SNAP_ROOT="$ROOT"
+  else
+    # Registry: keep the thread row current, using the status file as it is (this ping does not
+    # change it). A first event for a worktree may be an approval prompt, so this can create the row.
+    STATUS="$( { [ -f "$ROOT/.grokbot-status" ] && head -c 2000 "$ROOT/.grokbot-status" || printf turn_ended_no_status; }; printf '.')"
+    STATUS="${STATUS%.}"
+    WORD="$(printf '%s' "$STATUS" | awk 'NR==1 {print $1}')"
+    registry_record approval
+    registry_resolve "$ROOT" "$REG_ENV_THREAD"
+  fi
   STATUS="needs_input approval $SUMMARY"
   echo "$TS $HARNESS bot=$BOT branch=$BRANCH status=$(printf '%s' "$STATUS" | head -c 80)" >> "$LOG"
   ( post </dev/null >/dev/null 2>&1; echo "$(date '+%Y-%m-%dT%H:%M:%S%z') worker-complete" >> "$LOG" ) &

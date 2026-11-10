@@ -29,6 +29,8 @@ printf 'needs_input\nShould the export include archived rows? Options: (a) yes, 
 
 **Never remove this worktree yourself,** not even at the end. Do not run `git worktree remove` on it or delete its folder. Cleanup happens after your final turn.
 
+**Write files with your file tools, not with shell heredocs.** Create and edit files with the Write/Edit tools. If you need a script, save it to a file and run the file. Avoid `cat > file <<'EOF'` and `python3 - <<'EOF'` with long bodies: Claude Code's Bash check reads the whole command, and when the body merely mentions `rm` it stops on a "Dangerous rm operation not ruled out" approval prompt that nobody is there to answer. Keep shell commands short. This is about not triggering the prompt; never try to get around or switch off a permission check.
+
 **Stay on this task in this worktree.** If you are asked to start an unrelated task, say so and end the turn with `needs_input`. It needs a new thread.
 
 

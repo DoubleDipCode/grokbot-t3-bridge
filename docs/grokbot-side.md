@@ -37,6 +37,10 @@ Every brief the bot sends with `t3_thread_launch` ends with [templates/brief-foo
 
 3. **If it needs a decision:** write `needs_input` and end the turn instead of waiting inside T3. Ending the turn is what fires the hook. A thread that sits and waits never calls back.
 
+4. **Writing files:** use the Write/Edit tools, save scripts to a file and run the file, and avoid long shell heredocs. Claude Code's Bash check can stop on a heredoc body that only mentions `rm` ("Dangerous rm operation not ruled out"), even in a full-access thread. See [approval-prompts.md](approval-prompts.md).
+
+Threads your own thread starts with `delegate_task` need no marker for approval alerts: a prompt in such a thread (and any request T3 still shows as pending after 10 minutes) is sent to the bot of the thread that delegated it, with `sub_thread_id`, `sub_thread_title` and `parent_thread_id` in the payload. See [hooks.md](hooks.md#routing-for-marker-less-threads-and-the-pending-approvals-sweep). Finished turns of such threads are not pinged; the delegating thread is told by T3.
+
 Launch with `runtimeMode: "full-access"` and a worktree workspace. See [t3-mcp-setup.md](t3-mcp-setup.md).
 
 ## Two working rules

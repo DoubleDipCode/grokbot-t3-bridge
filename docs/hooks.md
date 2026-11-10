@@ -112,7 +112,7 @@ A thread blocked on a permission prompt has not ended its turn, so Stop never fi
 Both send the usual payload with status `needs_input approval <summary>` (summary: one line, at most 200 bytes) and they:
 
 - **Always ping.** No dedupe, like `needs_input`. They never read or write `.grokbot-status` or the dedupe cache, so the thread's own status is unchanged.
-- **Find the marker** in the hook's `cwd` or any parent up to the git toplevel. If the marker is gone but the worktree is in `markers.tsv`, they still ping.
+- **Find the marker** in the hook's `cwd` or any parent up to the git toplevel. If the marker is gone but the worktree is in `markers.tsv`, they still ping. With neither, a delegated or agent-launched T3 thread is [routed to its parent's bot](#routing-for-marker-less-threads-and-the-pending-approvals-sweep).
 - **Never block the harness.** Everything after reading stdin runs detached; curl has a 10-second timeout; nothing is printed and the exit code is 0. The Codex handler prints no decision, so Codex still shows its own prompt.
 - **Claude summary:** the command of the last `tool_use` in the transcript (`Bash: npm publish`) when it can be read, else the notification message (`Claude needs your permission to use Bash`). The transcript is only read for this one line and is never sent.
 - **Codex summary:** `tool_name: tool_input.description`, or the command when there is no description. Commands can contain secrets, so the summary is cut to 200 bytes and goes only to the bot's own webhook; log lines hold the first 80 bytes of status.
@@ -133,6 +133,36 @@ Hooks can miss a prompt (older harness, hook not trusted, config dir not registe
   2. For `GROKBOT_STALL_MINUTES` none of these changed: any file in the worktree except `.git` and `node_modules` (so build output counts, which spares long builds), the git `index`, `HEAD` and `logs/HEAD`, the newest Claude session log in `~/.claude*/projects/<worktree path>/`, and the transcript path saved by the last Stop ping.
 
 For the `approval?` variant `N` is the threshold ("at least N minutes"), because the age rule can overstate the quiet time. New activity from a running harness clears the revision's stall flag, so a second stall with the same status text pings again. A long task that writes no files and no session log for 45 minutes (a silent test run, say) can still false-positive once; raise `GROKBOT_STALL_MINUTES` for such projects. A thread blocked after a turn that wrote `done` is not flagged by `approval?`; the approval hooks cover that case, and a dead turn is covered by `turn_died`. Harness detection is the `pgrep` plus `lsof` check described in the README; if it fails, the sweep sends neither variant.
+
+## Routing for marker-less threads and the pending-approvals sweep
+
+On 2026-11-10 two builder threads that an orchestrator had started with `delegate_task` waited more than 30 minutes on Claude Code permission prompts and nobody was pinged. The `Notification` hook ran and was registered in the right config dir (`~/.claude-vmg`, set as `homePath` of that T3 provider), but the builders' worktrees had no `.grokbot` marker: only the orchestrator's did. The hook logged `claude-notify no-marker <worktree>` and exited, as designed. Two changes make that case loud.
+
+### Routing a prompt in a thread without a marker
+
+When an approval ping finds neither a marker nor a `markers.tsv` entry, it asks T3 which thread this is and who its parent is. In order:
+
+1. The thread: `T3CODE_THREAD_ID` from the hook's environment (Claude Code), else a lookup by worktree path (Codex).
+2. The parent chain: T3 stores `lineage.parentThreadId` for every thread, and `delegate_task` sets it to the thread that called it (`relationshipToParent: "subagent"`). The hook walks up (at most 6 levels) to the first thread whose worktree has a `.grokbot` marker or `markers.tsv` entry, or whose thread id has a row in `threads.sqlite`. That thread's bot gets the ping, with `route: "parent"` and the `sub_thread_*` and `parent_*` payload fields.
+3. Fallback, for a thread an agent launched over MCP (`createdBy: agent`, `creationSource: mcp`) without a bot-owned ancestor: the bot with the newest registry row in the same T3 project, `route: "project"`. Threads you started in the T3 window or on your phone (`createdBy: user`) never use it, so your own sessions do not ping a bot.
+
+A bot only counts when it has a webhook file (`~/.grokbot-hooks/<bot>.env`). Nothing is written to the routed worktree: no marker, no `markers.tsv` line, no registry row. `notify.log` shows `<harness> route=parent bot=<bot> sub=<id> parent=<id> <worktree>` for each routed ping, and `no-marker` when nothing matched. Only approval pings and the sweep below route this way; Stop and dead-turn handling still need the marker, because T3 already reports a delegated thread's finished turn to the thread that delegated it.
+
+The source for both lookups is T3's own data: the database lookup the registry already uses (`orchestration_v2_projection_threads`, `payload_json.lineage`), then `t3 thread show --json` (fields `parentThreadId`, `createdBy`, `creationSource`, `projectId`, `worktreePath`). Both are T3 internals that can change; if both fail the ping falls back to `no-marker` as before. `GROKBOT_ROUTE_PARENT=0` and `GROKBOT_ROUTE_PROJECT=0` switch the two routes off.
+
+Why not copy the marker at delegation time? Nothing in the hooks sees a delegation, and a marker written into someone else's worktree could outlive its meaning. Why not parse the delegated thread id? It carries only an opaque command id; the parent is not in it.
+
+### The pending-approvals sweep
+
+T3 keeps every approval prompt and question that is waiting for a human (`orchestration_v2_projection_runtime_requests`, `status = 'pending'`; `t3 thread show` reports the count as `pendingRequestCount`). On every sweep (each hook run in the background, and the launchd sweep) the hooks read that table read-only and, for each request that
+
+- is older than `GROKBOT_APPROVAL_MINUTES` (default `10`; `0` turns this off) and not older than 48 hours,
+- belongs to a thread that is not archived or deleted,
+- has a bot (its own marker, else the routes above),
+
+send one ping: status `stalled <N>m approval_pending <kind>`, `harness: "sweep"`, `thread_id` of the blocked thread, and the `route` fields. It is sent once per request (state in `state/approvals/`, keyed by a hash of the request id). Marked threads get it too, as a reminder after the immediate `needs_input approval` ping. A request with no bot is logged once as `sweep no-route approval thread=<id>`. A failed send is tried again by later sweeps, three attempts in all. A run sends at most 5 pings. The sweep does not touch the status-based stall state of any worktree.
+
+This is the safety net for prompts that no hook reported: a harness whose config dir has no hook registered, a hook that failed, or a provider that sends no event.
 
 ## What the script does
 
@@ -202,6 +232,9 @@ Both were silent, because a no-marker run was only logged in debug mode. Now the
 | `thread_id` | The T3 thread behind this worktree. Empty when it could not be found; fall back to `branch` and `worktree`. Plain Claude Code and Codex CLI sessions have no T3 thread, so it is empty there. |
 | `thread_title`, `project_id` | Title and T3 project id of that thread. Empty when unknown. |
 | `thread_source` | How the id was found: `env` (T3 put `T3CODE_THREAD_ID` in the hook's environment), `t3db` (read-only lookup by worktree path), or empty. |
+| `route` | How the ping found its bot: `marker` (`.grokbot` in the worktree), `map` (the worktree is in `markers.tsv` but its marker is gone), `parent` (the thread has no marker; its parent thread's bot), `project` (no marked ancestor; the project's most recent bot), or empty for older senders. |
+| `sub_thread_id`, `sub_thread_title` | Only on `parent` and `project` routes: the T3 thread that needs attention. It is not one of the bot's marked worktrees, so read it with `t3_thread_read` before anything else. `thread_id` and `thread_title` name the same thread. Empty otherwise. |
+| `parent_thread_id`, `parent_thread_title`, `parent_worktree` | Only on the `parent` route: the ancestor thread (the one whose worktree holds the marker, so usually the thread that called `delegate_task`) and its worktree. Empty otherwise. |
 | `my_open_threads` | At most `GROKBOT_SUMMARY_MAX` (default 8) lines `thread id\|status word\|branch\|title`, newest first, for this bot only: open threads, `done` ones until T3 settles or archives them, and `worktree_missing`. `-` stands for an unknown id. The title is cut to 40 characters and `\|` inside values becomes `/`. |
 | `my_open_threads_more` | How many more open threads the bot has beyond the lines listed. |
 
@@ -226,7 +259,7 @@ How the thread id is found, first match wins:
 
 A candidate is checked with T3's own command, `t3 thread show <id> --json`, which must report the same worktree; this also fills in the title, project, archived and settled flags, and detects deleted threads. If that command fails, the candidate is used unchecked, and the command is skipped for five minutes so a stopped T3 cannot slow the hook. A row is re-checked at most every 10 minutes by the hook and every 30 minutes by the sweep. Rows that are archived, settled or removed are deleted after 30 days.
 
-Settings (environment or `~/.grokbot-hooks/config`): `GROKBOT_REGISTRY=0` turns it all off (the new payload fields are then empty), `GROKBOT_SUMMARY_MAX` (default 8, 0 leaves `my_open_threads` empty), `GROKBOT_T3_CLI`, `GROKBOT_T3_DB`, `GROKBOT_T3_DB_LOOKUP=0` (never read T3's database). Look at it by hand with `sqlite3 -readonly ~/.grokbot-hooks/threads.sqlite 'select bot,state,status_word,thread_id,title from threads order by updated_at desc limit 20'`. The file is safe to delete; it is rebuilt from `markers.tsv` and from later turns. `notify.log` shows `registry-error` lines when something failed.
+Settings (environment or `~/.grokbot-hooks/config`): `GROKBOT_REGISTRY=0` turns it all off (the new payload fields are then empty), `GROKBOT_SUMMARY_MAX` (default 8, 0 leaves `my_open_threads` empty), `GROKBOT_T3_CLI`, `GROKBOT_T3_DB`, `GROKBOT_T3_DB_LOOKUP=0` (never read T3's database), and for [routing and pending approvals](#routing-for-marker-less-threads-and-the-pending-approvals-sweep) `GROKBOT_ROUTE_PARENT=0`, `GROKBOT_ROUTE_PROJECT=0` and `GROKBOT_APPROVAL_MINUTES`. Look at it by hand with `sqlite3 -readonly ~/.grokbot-hooks/threads.sqlite 'select bot,state,status_word,thread_id,title from threads order by updated_at desc limit 20'`. The file is safe to delete; it is rebuilt from `markers.tsv` and from later turns. `notify.log` shows `registry-error` lines when something failed.
 
 ### Status values
 
@@ -239,6 +272,7 @@ Settings (environment or `~/.grokbot-hooks/config`): `GROKBOT_REGISTRY=0` turns 
 | `turn_ended_no_status` | The worktree has a marker but no `.grokbot-status`. Read the thread. |
 | `needs_input approval <summary>` | Mid-turn: the harness is blocked on an approval or input prompt. Sent by `claude-notify` / `codex-permission`, harness field is that mode name. A bot cannot answer it; tell the human. |
 | `stalled <N>m turn_died <status>` | Sweep only: a turn started (turn-start hook) and never ended, no harness is running, and nothing changed for N minutes (default 45). Sent even if the old status was `done` or `waiting`. Once per dead turn. `<status>` is the worktree's last status text, `no_status` if there is none. Treat like `failed`. See [Turn-start hook](#turn-start-hook). |
+| `stalled <N>m approval_pending <kind>` | Sweep only (`harness: "sweep"`): T3's own list shows a request of that `kind` (`command`, `user_input`, ...) waiting for a human for N minutes. Once per request. See [pending approvals](#routing-for-marker-less-threads-and-the-pending-approvals-sweep). |
 | `stalled <N>m approval? <status>` | Sweep only (`harness: "sweep"`): a harness is running but nothing has changed for N minutes; it may be blocked on an approval prompt. `<status>` is the worktree's last status text. |
 | `worktree_missing` | The worktree is known from `markers.tsv` but has no marker now (removed, or the session's cwd is an old path). The full text is `worktree_missing worktree <path> no longer has a .grokbot marker (deleted or moved); read the thread for its real state`. `branch` is usually empty. Read the thread. |
 

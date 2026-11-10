@@ -23,6 +23,8 @@
 #   GROKBOT_T3_CLI=<path>      the t3 command (default: $T3CODE_CLI_PATH, then ~/.t3/bin/t3)
 #   GROKBOT_T3_DB=<path>       T3 state database (default: ${T3CODE_HOME:-~/.t3}/userdata/statev2.sqlite)
 #   GROKBOT_T3_DB_LOOKUP=0     never read T3's database
+#   GROKBOT_ROUTE_PARENT=0     do not route a thread without a marker to its parent thread's bot
+#   GROKBOT_ROUTE_PROJECT=0    do not fall back to the project's bot for such a thread
 
 REG_DB="${GROKBOT_REGISTRY_DB:-$DIR/threads.sqlite}"
 REG_US=$'\x1f'                       # field separator for sqlite output; cleaned values never contain it
@@ -409,6 +411,140 @@ registry_load_thread() {
   reg_q "$1"
   row="$(reg_run <<< "SELECT COALESCE(thread_id,''), COALESCE(title,''), COALESCE(project_id,''), COALESCE(thread_source,'') FROM threads WHERE worktree=$REG_Q;")" || return 0
   IFS="$REG_US" read -r THREAD_ID THREAD_TITLE PROJECT_ID THREAD_SOURCE <<< "$row"
+}
+
+# --- Routing for threads without a marker (delegated sub-threads) -------------------------------------
+# A builder that a bot's thread started with delegate_task runs in its own worktree, which never got
+# a .grokbot marker. T3 records the link: each thread has lineage.parentThreadId. registry_route walks
+# up that chain to the first ancestor whose worktree has a marker (or whose id the registry knows) and
+# returns that ancestor's bot. Fallback: a thread that was started by an agent over MCP, in a project
+# where exactly one bot has been working, goes to the bot that worked there most recently.
+# Config: GROKBOT_ROUTE_PARENT=0 turns off the lineage route, GROKBOT_ROUTE_PROJECT=0 the project one.
+
+# reg_wt_bot <worktree>: sets WT_BOT and WT_ROUTE (marker|map) from the worktree's .grokbot marker, else
+# from markers.tsv. A bot only counts when it has a webhook file. Returns 1 when there is none.
+reg_wt_bot() {
+  local wt="$1" b=
+  WT_BOT=; WT_ROUTE=
+  [ -n "$wt" ] || return 1
+  if [ -f "$wt/.grokbot" ]; then
+    b="$(head -n1 "$wt/.grokbot" 2>/dev/null | tr -cd 'a-z0-9_-')"
+    [ -z "$b" ] || [ ! -f "$DIR/$b.env" ] || { WT_BOT="$b"; WT_ROUTE=marker; return 0; }
+  fi
+  b="$(awk -F'\t' -v r="$wt" '$1==r {b=$2} END{print b}' "$MAP" 2>/dev/null | tr -cd 'a-z0-9_-')"
+  [ -z "$b" ] || [ ! -f "$DIR/$b.env" ] || { WT_BOT="$b"; WT_ROUTE=map; return 0; }
+  return 1
+}
+
+# reg_t3_query <sql>: read-only query on T3's database, capped at 3 seconds. Any failure is "no rows".
+reg_t3_query() {
+  local db="${GROKBOT_T3_DB:-${T3CODE_HOME:-$HOME/.t3}/userdata/statev2.sqlite}"
+  [ "${GROKBOT_T3_DB_LOOKUP:-1}" != 0 ] && [ -f "$db" ] || return 1
+  reg_timeout 3 "$REG_SQLITE" -readonly -batch -cmd '.timeout 1500' -separator "$REG_US" -nullvalue '' "$db" "$1" 2>/dev/null
+}
+
+# reg_thread_info <thread id> <worktree>: sets TI_ID TI_PROJECT TI_TITLE TI_BY TI_SOURCE TI_PARENT TI_WT
+# TI_ARCHIVED for one T3 thread, found by id when given, else by worktree path. From T3's database,
+# then `t3 thread show` (which reports the same fields). Returns 1 when neither knows it.
+reg_thread_info() {
+  local id="$1" root="$2" cond out q1 q2 real cli line
+  TI_ID=; TI_PROJECT=; TI_TITLE=; TI_BY=; TI_SOURCE=; TI_PARENT=; TI_WT=; TI_ARCHIVED=0
+  if [ -n "$id" ]; then
+    reg_q "$id"; cond="thread_id=$REG_Q"
+  elif [ -n "$root" ]; then
+    real="$(reg_realpath "$root")"
+    reg_q "$root"; q1="$REG_Q"; reg_q "$real"; q2="$REG_Q"
+    cond="json_extract(payload_json,'\$.worktreePath') IN ($q1,$q2)"
+  else
+    return 1
+  fi
+  out="$(reg_t3_query "SELECT thread_id, COALESCE(project_id,''), COALESCE(title,''),
+      COALESCE(json_extract(payload_json,'\$.createdBy'),''), COALESCE(json_extract(payload_json,'\$.creationSource'),''),
+      COALESCE(json_extract(payload_json,'\$.lineage.parentThreadId'),''), COALESCE(json_extract(payload_json,'\$.worktreePath'),''),
+      (archived_at IS NOT NULL)
+    FROM orchestration_v2_projection_threads
+    WHERE deleted_at IS NULL AND $cond ORDER BY (archived_at IS NULL) DESC, updated_at DESC LIMIT 1;" | head -n1)"
+  if [ -z "$out" ] && [ -n "$id" ]; then
+    # The database may have changed shape: T3's own command knows the same fields.
+    cli="${GROKBOT_T3_CLI:-${T3CODE_CLI_PATH:-$HOME/.t3/bin/t3}}"
+    [ -x "$cli" ] || return 1
+    [ ! -f "$STATE/t3cli.fail" ] || [ -n "$(find "$STATE/t3cli.fail" -mmin "+$((REG_BREAKER_SECONDS / 60))" -print 2>/dev/null)" ] || return 1
+    out="$(reg_timeout 8 "$cli" thread show "$id" --json --messages 0 2>/dev/null </dev/null)" || return 1
+    out="$(printf '%s' "$out" | "$JQ" -r '.thread | [ .threadId, (.projectId // ""), (.title // ""), (.createdBy // ""),
+        (.creationSource // ""), (.parentThreadId // ""), (.worktreePath // ""), ((.archived // false) | if . then 1 else 0 end)
+      ] | map(tostring | gsub("[\\x00-\\x1f]"; " ")) | join("\u001f")' 2>/dev/null)"
+  fi
+  [ -n "$out" ] || return 1
+  IFS="$REG_US" read -r TI_ID TI_PROJECT TI_TITLE TI_BY TI_SOURCE TI_PARENT TI_WT TI_ARCHIVED <<< "$out"
+  [ -n "$TI_ID" ] || return 1
+  reg_clean "$TI_TITLE" 200 field; TI_TITLE="$REG_C"
+}
+
+# reg_bot_by_thread <thread id>: the bot of a registry row for that thread (the ancestor's worktree
+# may be gone). Prints nothing when unknown or when the bot has no webhook file.
+reg_bot_by_thread() {
+  local b
+  [ -n "$1" ] && reg_on && [ -f "$REG_DB" ] || return 1
+  reg_q "$1"
+  b="$(reg_run <<< "SELECT bot FROM threads WHERE thread_id=$REG_Q ORDER BY updated_at DESC LIMIT 1;" | tr -cd 'a-z0-9_-')" || return 1
+  [ -n "$b" ] && [ -f "$DIR/$b.env" ] || return 1
+  printf '%s' "$b"
+}
+
+# registry_route <worktree> [thread id]: finds the bot for a thread that has no marker of its own.
+# Sets ROUTE_BOT, ROUTE (marker|map: the thread's own worktree after all; parent: an ancestor's bot;
+# project: the project's bot) and SUB_ID SUB_TITLE SUB_ROOT (the thread that needs attention) plus
+# PARENT_ID PARENT_TITLE PARENT_ROOT (the ancestor that owns the bot, parent route only).
+# Returns 1 when there is no bot. The thread id is the hook's T3CODE_THREAD_ID when there is one, else
+# the thread is found by worktree path.
+registry_route() {
+  local root="$1" env_id="${2:-}" cur depth=0 seen=" " project by src b
+  ROUTE_BOT=; ROUTE=; SUB_ID=; SUB_TITLE=; SUB_ROOT=; PARENT_ID=; PARENT_TITLE=; PARENT_ROOT=
+  if [ -n "$env_id" ] && reg_thread_info "$env_id" "$root"; then :
+  elif ! reg_thread_info "" "$root"; then return 1; fi
+  SUB_ID="$TI_ID"; SUB_TITLE="$TI_TITLE"; SUB_ROOT="${TI_WT:-$root}"; project="$TI_PROJECT"; by="$TI_BY"; src="$TI_SOURCE"
+  cur="$TI_PARENT"
+  # The thread's own worktree may carry a marker (a sweep asking about a marked worktree).
+  if reg_wt_bot "$TI_WT"; then ROUTE_BOT="$WT_BOT"; ROUTE="$WT_ROUTE"; return 0; fi
+  if [ "${GROKBOT_ROUTE_PARENT:-1}" != 0 ]; then
+    while [ -n "$cur" ] && [ "$depth" -lt 6 ]; do
+      case "$seen" in *" $cur "*) break ;; esac
+      seen="$seen$cur "; depth=$((depth + 1))
+      if ! reg_thread_info "$cur" ""; then
+        # T3 no longer lists the ancestor, but a registry row may still name it.
+        if b="$(reg_bot_by_thread "$cur")"; then
+          ROUTE_BOT="$b"; ROUTE=parent; PARENT_ID="$cur"; return 0
+        fi
+        break
+      fi
+      if reg_wt_bot "$TI_WT"; then b="$WT_BOT"; else b="$(reg_bot_by_thread "$TI_ID")" || b=; fi
+      if [ -n "$b" ]; then
+        ROUTE_BOT="$b"; ROUTE=parent; PARENT_ID="$TI_ID"; PARENT_TITLE="$TI_TITLE"; PARENT_ROOT="$TI_WT"
+        return 0
+      fi
+      cur="$TI_PARENT"
+    done
+  fi
+  # Fallback: an agent-launched thread (not one of your own in the T3 window) in a project with a bot.
+  if [ "${GROKBOT_ROUTE_PROJECT:-1}" != 0 ] && [ -n "$project" ] && [ "$by" = agent ] && [ "$src" = mcp ] && registry_init; then
+    reg_q "$project"
+    b="$(reg_run <<< "SELECT bot FROM threads WHERE project_id=$REG_Q ORDER BY updated_at DESC LIMIT 1;" | tr -cd 'a-z0-9_-')" || b=
+    if [ -n "$b" ] && [ -f "$DIR/$b.env" ]; then ROUTE_BOT="$b"; ROUTE=project; return 0; fi
+  fi
+  return 1
+}
+
+# registry_pending_requests <min age s> <max age s>: one line per request that T3 still holds as
+# pending (an approval or a question waiting for a human) for its open threads, oldest first, at most
+# 20: request id, thread id, kind (command, file_change, user_input, ...), created time in epoch seconds.
+registry_pending_requests() {
+  reg_t3_query "SELECT r.runtime_request_id, r.thread_id, r.kind, CAST(strftime('%s', r.created_at) AS INTEGER)
+    FROM orchestration_v2_projection_runtime_requests r
+    JOIN orchestration_v2_projection_threads t ON t.thread_id = r.thread_id
+    WHERE r.status = 'pending' AND t.deleted_at IS NULL AND t.archived_at IS NULL
+      AND CAST(strftime('%s', r.created_at) AS INTEGER) <= CAST(strftime('%s', 'now') AS INTEGER) - $1
+      AND CAST(strftime('%s', r.created_at) AS INTEGER) >= CAST(strftime('%s', 'now') AS INTEGER) - $2
+    ORDER BY r.created_at LIMIT 20;"
 }
 
 # registry_summary <bot>: sets SUMMARY_JSON (a JSON array of at most GROKBOT_SUMMARY_MAX strings
