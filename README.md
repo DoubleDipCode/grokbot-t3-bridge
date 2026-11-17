@@ -91,6 +91,9 @@ README.md                 this file
 ONE-SHOT-PROMPT.md        paste-in prompt for building your own version from scratch
 install.sh                installs the hooks for Codex and every Claude config dir (idempotent)
 uninstall.sh              removes the hook entries again
+scripts/sync-global-rules.sh      builds ~/.codex/AGENTS.md from the shared rules file (see Global agent rules)
+scripts/install-global-rules.sh   backs up, installs the sync script and its launchd agent
+scripts/uninstall-global-rules.sh removes the launchd agent again
 hooks/config-lib.sh       shared parser for the optional config file and Claude dir detection
 hooks/notify.sh           Stop hook, turn-start hook, approval-prompt pings and sweeps: reads marker + status, POSTs to the bot
 hooks/registry-lib.sh     thread registry (threads.sqlite): finds the T3 thread for each worktree, builds my_open_threads,
@@ -109,6 +112,22 @@ docs/grokbot-side.md      webhook routine, brief additions, backup check, cleanu
 templates/routine-prompt.md   prompt for the "T3 callback" routine
 templates/brief-footer.md     text to append to every brief sent to T3
 ```
+
+## Global agent rules: one file for Claude Code and Codex
+
+Rules that every agent session on this Mac should follow live in **one file: `~/.agents/global-rules.md`**. Edit that file and nothing else.
+
+- **Claude Code** loads it: `~/.claude/CLAUDE.md` is just the line `@~/.agents/global-rules.md` (plus any Claude-only lines you write below it). The other Claude config dirs (`~/.claude-personal`, `~/.claude-vmg`) symlink to that file.
+- **Codex** cannot import files, so `~/.codex/AGENTS.md` is **generated**: a header, then the shared file, then `~/.agents/codex-only.md` if that exists. The Codex homes `~/.codex-api` and `~/.codex-t3/proxy` symlink to it. Do not edit it; a hand edit is replaced (a copy is kept in `~/.agents/.global-rules-sync/unsynced/`).
+- A launchd agent (`com.grokbot.sync-global-rules`) runs `~/.grokbot-hooks/sync-global-rules.sh` whenever the shared file, `codex-only.md`, `AGENTS.md` or `CLAUDE.md` changes, at login and every 30 minutes. It writes nothing when nothing changed. Log: `~/.agents/.global-rules-sync/sync.log`. To run it by hand, run that script.
+
+**Add a rule:** append a section to `~/.agents/global-rules.md`, for example `## Rule name (added YYYY-MM-DD, why)` and the text. Within seconds `AGENTS.md` is rebuilt; new Claude Code and Codex sessions pick it up (sessions already running keep what they loaded). Claude-only rule: put it in `~/.claude/CLAUDE.md` below the import line. Codex-only rule: put it in `~/.agents/codex-only.md`.
+
+**Installers that edit these files.** The Atoll skill installer and the CI run notifier rewrite their block between `<!-- ATOLL:GLOBAL-INSTRUCTIONS:START/END -->` and `<!-- CI-RUN-NOTIFICATIONS:START/END -->` markers in `AGENTS.md`, and the notifier also appends its block to `CLAUDE.md`. Before it rebuilds, the sync copies those two blocks back into the shared file and removes the copy from `CLAUDE.md`, so a re-run of either installer is kept, not overwritten, and nothing is duplicated. Both installers refuse a symlink target, which is why `~/.codex/AGENTS.md` and `~/.claude/CLAUDE.md` stay regular files. A new marker name needs adding to `MARKERS` in the script.
+
+**Safety.** The sync refuses to run (exit 3, prints no match) if the shared or Codex-only file contains secret-like text, so keep secrets out of these files.
+
+**Set up or repair:** `bash scripts/install-global-rules.sh` (idempotent; first run keeps `CLAUDE.md.bak-pre-sync` and `AGENTS.md.bak-pre-sync`; `--seed` starts a missing shared file from AGENTS.md). Remove with `bash scripts/uninstall-global-rules.sh`; to go back to hand-kept files copy the two `.bak-pre-sync` files over the live ones. Test: `bash tests/sync-global-rules-test.sh`.
 
 ## Thread registry: bots never list threads
 
@@ -228,6 +247,7 @@ only the state directory. Put the tunables in `~/.grokbot-hooks/config` (below) 
 launchd sees them too; `GROKBOT_HOOKS_DIR` has to be an environment variable.
 
 Run `python3 tests/notify-http-test.py` for local HTTP payload tests for all three paths.
+Run `bash tests/sync-global-rules-test.sh` for the global rules sync and its installer against a temporary HOME.
 Run `bash tests/install-test.sh` for the installer and uninstaller against a temporary HOME.
 Run `bash tests/stall-test.sh` for stall watchdog cases.
 Run `bash tests/turn-start-test.sh` for the turn-start hook and dead-turn cases.
