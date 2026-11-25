@@ -16,6 +16,8 @@ In each coding bot, create a webhook routine named **T3 callback**.
 
   Paste the URL when asked, then the Authorization value. The second prompt hides your input. You can paste either `Bearer ...` or the whole `Authorization: Bearer ...` line.
 
+**OpenBot instead of Grok Bot:** create an OpenBot webhook routine, copy its URL and signing secret, and run `~/.grokbot-hooks/set-webhook.sh <bot-name> openbot`. The routine receives `{"type":"t3.callback","occurredAt":...,"data":{...}}`; every payload field is under `data`. Setup and the extra prompt line are in [templates/openbot-routine-prompt.md](../templates/openbot-routine-prompt.md). Bots can move one at a time: each bot's env file picks its own mode.
+
 Use the same `<bot-name>` in the brief footer. One routine, one URL and one key per bot: the marker names the bot, so the callback goes only to the bot that launched the thread.
 
 Do not paste the URL or key into a chat, a brief or a prompt. They only belong in the routine panel and in `~/.grokbot-hooks/<bot>.env`.

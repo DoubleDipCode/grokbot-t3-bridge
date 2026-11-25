@@ -16,8 +16,8 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # 1. Copy the scripts.
 mkdir -p "$DEST"
 chmod 700 "$DEST"
-cp "$SRC/hooks/notify.sh" "$SRC/hooks/set-webhook.sh" "$SRC/hooks/config-lib.sh" "$SRC/hooks/registry-lib.sh" "$DEST/"
-chmod 700 "$DEST/notify.sh" "$DEST/set-webhook.sh" "$DEST/config-lib.sh" "$DEST/registry-lib.sh"
+cp "$SRC/hooks/notify.sh" "$SRC/hooks/set-webhook.sh" "$SRC/hooks/config-lib.sh" "$SRC/hooks/registry-lib.sh" "$SRC/hooks/openbot-sign.py" "$DEST/"
+chmod 700 "$DEST/notify.sh" "$DEST/set-webhook.sh" "$DEST/config-lib.sh" "$DEST/registry-lib.sh" "$DEST/openbot-sign.py"
 echo "Installed scripts to $DEST"
 # The optional local config ($DEST/config) is never created or overwritten here.
 # shellcheck source=hooks/config-lib.sh
@@ -102,9 +102,10 @@ Next steps:
      "Recording turn start" UserPromptSubmit hook. Do this for every Codex home you use, for example
      plain codex and CODEX_HOME=~/.codex-t3/proxy codex.
      Sessions that were already running keep their old hooks, so test in a new thread.
-  2. For each bot, create a "T3 callback" webhook routine in Grok Bot, then run:
+  2. For each bot, create a "T3 callback" webhook routine (Grok Bot, or an OpenBot webhook routine), then run:
        $DEST/set-webhook.sh <bot-name>
-     and paste the URL and the Authorization header value when asked.
+     Choose grokbot and paste the URL and the Authorization header value, or choose openbot and
+     paste the URL and the signing secret. OpenBot mode needs python3.
   3. While testing: tail -f $DEST/notify.log  (turns without a marker show up as no-marker)
   4. Optional: tune thresholds or name extra Claude config dirs in $DEST/config
      (copy examples/config.example; install.sh never overwrites it).

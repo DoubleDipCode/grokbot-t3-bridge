@@ -276,7 +276,9 @@ Settings (environment or `~/.grokbot-hooks/config`): `GROKBOT_REGISTRY=0` turns 
 | `stalled <N>m approval? <status>` | Sweep only (`harness: "sweep"`): a harness is running but nothing has changed for N minutes; it may be blocked on an approval prompt. `<status>` is the worktree's last status text. |
 | `worktree_missing` | The worktree is known from `markers.tsv` but has no marker now (removed, or the session's cwd is an old path). The full text is `worktree_missing worktree <path> no longer has a .grokbot marker (deleted or moved); read the thread for its real state`. `branch` is usually empty. Read the thread. |
 
-Request headers: `Content-Type: application/json` and, if set, `Authorization: <value from set-webhook.sh>`.
+Request headers in Grok Bot mode: `Content-Type: application/json` and, if set, `Authorization: <value from set-webhook.sh>`.
+
+In OpenBot mode (`GROKBOT_WEBHOOK_MODE=openbot` in the bot's env file) the object above is sent inside a signed wrapper, `{"type":"t3.callback","occurredAt":"<ISO 8601>","data":<this payload>}`, with the headers `x-openbot-timestamp`, `x-openbot-delivery-id` and `x-openbot-signature` instead of `Authorization`. See [OpenBot webhooks](../README.md#openbot-webhooks).
 
 ## Testing and debugging
 
@@ -296,7 +298,13 @@ What the log lines mean:
 | `... status=worktree_missing worktree /path ...` | Known worktree, marker gone. The bot was notified and should read the thread. |
 | `... codex bot=codexbot branch=... status=done` | Hook ran in a bot worktree. |
 | `... codexbot webhook http=200` | Callback delivered. |
-| `... codexbot webhook http=401` | Wrong or missing Authorization value. Run `set-webhook.sh` again. |
+| `... codexbot webhook http=401` | Wrong or missing Authorization value. Run `set-webhook.sh` again. In OpenBot mode (`mode=openbot` at the end of the line): wrong signing secret, or the Mac's clock is more than 5 minutes off. |
+| `... codexbot webhook http=202 result=0 mode=openbot` | OpenBot accepted the callback (`http=200` there: it had that delivery id already). |
+| `... codexbot webhook openbot-retry-503` | OpenBot said 503 (host offline or busy); the hook tried once more after a second. The next `webhook http=` line is the retry's result. |
+| `... codexbot webhook http=404` / `http=413` / `http=400` | OpenBot mode: the routine is gone (run `set-webhook.sh` with the new URL), the body was too large, or the body was refused. |
+| `... codexbot webhook openbot-no-secret` | The env file says `GROKBOT_WEBHOOK_MODE=openbot` but has no `GROKBOT_WEBHOOK_SECRET`. Nothing was sent. |
+| `... codexbot webhook unknown-mode` | `GROKBOT_WEBHOOK_MODE` is neither empty/`grokbot` nor `openbot` (it is case sensitive). Nothing was sent. |
+| `... codexbot webhook openbot-no-signer` / `openbot-sign-failed rc=N` | `openbot-sign.py` is missing (run `install.sh` again) or could not sign (`rc=2` bad URL or payload, `rc=3` payload cannot be shrunk below 64 KB). Nothing was sent. |
 | `... codexbot webhook http=000` | Could not connect (offline, wrong URL). The curl error is on the line above. |
 | a `status=` line but no `webhook` line | No `~/.grokbot-hooks/<bot>.env` for that bot name. |
 | nothing at all | The hook did not run. For Codex, check `/hooks` and test in a new thread. |

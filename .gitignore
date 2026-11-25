@@ -13,3 +13,4 @@ debug
 .grokbot-status
 
 .DS_Store
+__pycache__/
