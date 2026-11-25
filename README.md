@@ -76,7 +76,7 @@ You need macOS or Linux with `bash`, `jq`, `git`, `perl`, `shasum` and `curl` on
    ~/.grokbot-hooks/set-webhook.sh codexbot
    ```
 
-   It asks whether the webhook is `grokbot` or `openbot` (or pass it: `set-webhook.sh codexbot openbot`). For `grokbot` it asks for the URL and then the Authorization header value; for `openbot` it asks for the URL and then the signing secret. Secrets are entered with hidden input. It writes `~/.grokbot-hooks/codexbot.env` with mode 600. Bot names are lowercase letters, digits, `-` and `_`.
+   It asks whether the webhook is `grokbot` or `openbot` (or pass it: `set-webhook.sh codexbot openbot`). For `grokbot` it asks for the URL and then the Authorization header value; for `openbot` it asks for the URL and then the signing secret. The Authorization value, the OpenBot URL and the OpenBot signing secret are entered with hidden input. It writes `~/.grokbot-hooks/codexbot.env` with mode 600. Bot names are lowercase letters, digits, `-` and `_`.
 
    Each bot has its own env file, so bots can be moved from Grok Bot to OpenBot one at a time: run `set-webhook.sh <bot> openbot` for the bots that moved, and leave the rest as they are. See [OpenBot webhooks](#openbot-webhooks).
 

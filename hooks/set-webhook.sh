@@ -18,9 +18,10 @@ while :; do
   read -r -p "Webhook type for $BOT (grokbot or openbot): " KIND || { echo >&2; exit 1; }
 done
 ENV_FILE="$HOME/.grokbot-hooks/$BOT.env"
-read -r -p "Webhook URL for $BOT: " URL || exit 1
 umask 077
 if [ "$KIND" = openbot ]; then
+  # An OpenBot webhook URL is itself a credential, so it is hidden like the secret.
+  read -r -s -p "Webhook URL for $BOT (input hidden): " URL || exit 1; echo
   # Surrounding spaces from a paste would break the signature or the URL.
   URL="${URL#"${URL%%[![:space:]]*}"}"; URL="${URL%"${URL##*[![:space:]]}"}"
   case "$URL" in http://*|https://*) ;; *) echo "The URL must start with https:// (or http://)." >&2; exit 1 ;; esac
@@ -32,6 +33,7 @@ if [ "$KIND" = openbot ]; then
   printf 'GROKBOT_WEBHOOK_MODE=openbot\nGROKBOT_WEBHOOK_URL=%q\nGROKBOT_WEBHOOK_SECRET=%q\n' "$URL" "$SECRET" > "$TMP" \
     && chmod 600 "$TMP" && mv -f "$TMP" "$ENV_FILE" || { rm -f "$TMP"; echo "Could not write $ENV_FILE" >&2; exit 1; }
 else
+  read -r -p "Webhook URL for $BOT: " URL || exit 1
   read -r -s -p "Authorization header value (input hidden): " AUTH; echo
   # Accept either "Bearer xyz" or a pasted "Authorization: Bearer xyz".
   AUTH="${AUTH#Authorization: }"

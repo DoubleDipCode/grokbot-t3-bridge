@@ -356,6 +356,37 @@ def main():
             assert result.returncode == 0, result.stderr
             assert stat.S_IMODE(written.stat().st_mode) == 0o600
             assert written.read_text() == 'GROKBOT_WEBHOOK_URL=https://grok.test/h\nGROKBOT_WEBHOOK_AUTH=Bearer\\ tok\n', written.read_text()
+            # On a real terminal neither the OpenBot URL nor the secret is echoed (the pipe tests above
+            # cannot see echo, so use a pty); the Grok Bot URL prompt stays visible, as before.
+            import pty, select
+            def on_terminal(answers, *args):
+                master, slave = pty.openpty()
+                proc = subprocess.Popen(['bash', script, 'ttybot', *args], env=set_env, stdin=slave,
+                                        stdout=slave, stderr=slave, close_fds=True)
+                os.close(slave)
+                shown = b''
+                for answer in answers:
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline and select.select([master], [], [], 0.1)[0]:
+                        shown += os.read(master, 4096)
+                    os.write(master, answer.encode() + b'\n')
+                proc.wait(timeout=10)
+                while select.select([master], [], [], 0.1)[0]:
+                    try:
+                        chunk = os.read(master, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    shown += chunk
+                os.close(master)
+                return proc.returncode, shown
+            code, shown = on_terminal(['https://tty.test/ZXQTTYURL', 'ZXQTTYSECRET'], 'openbot')
+            assert code == 0, shown
+            assert b'ZXQTTYURL' not in shown and b'ZXQTTYSECRET' not in shown, shown
+            assert 'ZXQTTYURL' in (root / 'sethome/.grokbot-hooks/ttybot.env').read_text()
+            code, shown = on_terminal(['https://tty.test/visible', 'Bearer ZXQTTYAUTH'], 'grokbot')
+            assert code == 0 and b'tty.test/visible' in shown and b'ZXQTTYAUTH' not in shown, shown
             # Closed input ends the question loop instead of spinning.
             result = subprocess.run(['bash', script, 'newbot'], env=set_env, capture_output=True, text=True,
                                     input='', timeout=10)
