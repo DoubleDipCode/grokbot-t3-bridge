@@ -32,6 +32,7 @@ for d in .claude .claude-work; do
 done
 [ "$(cmds "$HOME/.codex/hooks.json" UserPromptSubmit | grep -c 'notify.sh codex-start$')" = 1 ] || { echo 'FAIL: codex UserPromptSubmit'; exit 1; }
 [ -x "$HOME/.grokbot-hooks/registry-lib.sh" ] || { echo 'FAIL: registry-lib.sh not installed'; exit 1; }
+[ -x "$HOME/.grokbot-hooks/openbot-sign.py" ] || { echo 'FAIL: openbot-sign.py not installed'; exit 1; }
 # Idempotent: a second run changes nothing and makes no new backup.
 before="$(find "$HOME" -name '*.bak-grokbot-*' | wc -l | tr -d ' ')"
 sum1="$(cat "$HOME"/.claude*/settings.json "$HOME/.codex/hooks.json" | shasum)"

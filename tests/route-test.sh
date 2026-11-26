@@ -23,6 +23,14 @@ while [ "$#" -gt 0 ]; do
     [ ! -f "$FAKE_T3/CURL_FAIL" ] || { printf 500; exit 0; }
     printf '%s\n' "$2" | jq -c . >> "$CALLS"; break
   fi
+  if [ "$1" = -K ]; then
+    # OpenBot: the request (headers, signature, body) comes as a curl config on stdin.
+    cfg="$(cat)"
+    [ ! -f "$FAKE_T3/CURL_FAIL" ] || { printf 500; exit 0; }
+    case "$cfg" in *'header = "x-openbot-signature: sha256='*) ;; *) printf 400; exit 0 ;; esac
+    printf '%s\n' "$cfg" | sed -n 's/^data-binary = //p' | jq -c 'fromjson | select(.type == "t3.callback") | .data' >> "$CALLS"
+    printf 202; exit 0
+  fi
   shift
 done
 printf 200
@@ -56,8 +64,17 @@ db_request() {
   sqlite3 "$GROKBOT_T3_DB" "INSERT INTO orchestration_v2_projection_runtime_requests VALUES('$1','$2','$3','$4',strftime('%Y-%m-%dT%H:%M:%fZ','now','-$5 minutes'),NULL);"
 }
 mkwt() { mkdir -p "$TMP/$1"; git -C "$TMP/$1" init -q -b "br-$1"; (cd "$TMP/$1" && pwd -P); }
-printf 'GROKBOT_WEBHOOK_URL=http://test.invalid\n' > "$GROKBOT_HOOKS_DIR/orcy.env"
-printf 'GROKBOT_WEBHOOK_URL=http://test.invalid\n' > "$GROKBOT_HOOKS_DIR/tooly.env"
+if [ "${ROUTE_MODE:-}" = openbot ]; then
+  # Same checks again with both bots on OpenBot webhooks: every routed ping must still arrive,
+  # now signed. The stub curl reads the request from the config the hook pipes in (curl -K -).
+  cp "$REPO/hooks/openbot-sign.py" "$GROKBOT_HOOKS_DIR/"
+  for b in orcy tooly; do
+    printf 'GROKBOT_WEBHOOK_MODE=openbot\nGROKBOT_WEBHOOK_URL=http://test.invalid\nGROKBOT_WEBHOOK_SECRET=route-test-secret\n' > "$GROKBOT_HOOKS_DIR/$b.env"
+  done
+else
+  printf 'GROKBOT_WEBHOOK_URL=http://test.invalid\n' > "$GROKBOT_HOOKS_DIR/orcy.env"
+  printf 'GROKBOT_WEBHOOK_URL=http://test.invalid\n' > "$GROKBOT_HOOKS_DIR/tooly.env"
+fi
 
 # The orchestrator (marked, bot orcy) and two builders it delegated; a grandchild; strangers.
 WP="$(mkwt parent)"; printf 'orcy\n' > "$WP/.grokbot"
@@ -294,4 +311,7 @@ sweep
 count 0
 mv "$GROKBOT_HOOKS_DIR/registry-lib.sh.off" "$GROKBOT_HOOKS_DIR/registry-lib.sh"
 
-echo 'PASS: routing of marker-less sub-threads (parent route, grandchild, Codex path lookup, project fallback, CLI fallback, switches) and the pending-approval sweep (age window, once per request, retries, archived, no-route)'
+if [ "${ROUTE_MODE:-}" != openbot ]; then
+  ROUTE_MODE=openbot bash "$0" || exit 1
+fi
+echo "PASS${ROUTE_MODE:+ ($ROUTE_MODE mode)}: routing of marker-less sub-threads (parent route, grandchild, Codex path lookup, project fallback, CLI fallback, switches) and the pending-approval sweep (age window, once per request, retries, archived, no-route)"

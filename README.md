@@ -68,7 +68,7 @@ You need macOS or Linux with `bash`, `jq`, `git`, `perl`, `shasum` and `curl` on
 
 3. **Trust the hook in Codex.** Run `codex`, type `/hooks`, and trust the "Notifying Grok Bot" hook. Trust the `PermissionRequest` one as well. Claude Code has no trust step. See [docs/hooks.md](docs/hooks.md).
 
-4. **Create a webhook routine per bot** in Grok Bot, named "T3 callback", using [templates/routine-prompt.md](templates/routine-prompt.md) as its prompt. Copy its URL and Authorization header from the routine panel. See [docs/grokbot-side.md](docs/grokbot-side.md).
+4. **Create a webhook routine per bot**, named "T3 callback", using [templates/routine-prompt.md](templates/routine-prompt.md) as its prompt. In Grok Bot, copy its URL and Authorization header from the routine panel. In OpenBot, create a webhook routine and copy its URL and signing secret; see [templates/openbot-routine-prompt.md](templates/openbot-routine-prompt.md). See [docs/grokbot-side.md](docs/grokbot-side.md).
 
 5. **Store each bot's webhook** on the Mac (or Linux machine):
 
@@ -76,13 +76,40 @@ You need macOS or Linux with `bash`, `jq`, `git`, `perl`, `shasum` and `curl` on
    ~/.grokbot-hooks/set-webhook.sh codexbot
    ```
 
-   It asks for the URL and then the Authorization header value with hidden input, and writes `~/.grokbot-hooks/codexbot.env` with mode 600. Bot names are lowercase letters, digits, `-` and `_`.
+   It asks whether the webhook is `grokbot` or `openbot` (or pass it: `set-webhook.sh codexbot openbot`). For `grokbot` it asks for the URL and then the Authorization header value; for `openbot` it asks for the URL and then the signing secret. The Authorization value, the OpenBot URL and the OpenBot signing secret are entered with hidden input. It writes `~/.grokbot-hooks/codexbot.env` with mode 600. Bot names are lowercase letters, digits, `-` and `_`.
+
+   Each bot has its own env file, so bots can be moved from Grok Bot to OpenBot one at a time: run `set-webhook.sh <bot> openbot` for the bots that moved, and leave the rest as they are. See [OpenBot webhooks](#openbot-webhooks).
 
 6. **Add the brief footer** from [templates/brief-footer.md](templates/brief-footer.md) to every brief the bot sends to T3. It tells the coding agent to write the `.grokbot` marker and a `.grokbot-status` file.
 
 7. **Test it.** Have the bot launch a small thread, then watch `~/.grokbot-hooks/notify.log`. You should see a `status=` line followed by `webhook http=200`.
 
 To remove the hook entries later, run `./uninstall.sh`.
+
+## OpenBot webhooks
+
+A bot's webhook is either a Grok Bot webhook (the default) or an OpenBot webhook. OpenBot webhook routines only accept signed requests, so `notify.sh` has a second mode. The mode is set per bot, in its env file, and is never guessed:
+
+| `~/.grokbot-hooks/<bot>.env` | Request |
+| --- | --- |
+| `GROKBOT_WEBHOOK_URL`, `GROKBOT_WEBHOOK_AUTH` (no mode line) | Grok Bot mode, unchanged: the payload as the body, an `Authorization` header. |
+| `GROKBOT_WEBHOOK_MODE=openbot`, `GROKBOT_WEBHOOK_URL`, `GROKBOT_WEBHOOK_SECRET` | OpenBot mode: signed, payload wrapped. Any other mode value sends nothing and logs `unknown-mode`. |
+
+Set it up:
+
+1. In OpenBot, create a webhook routine for the bot ("T3 callback") with the prompt from [templates/openbot-routine-prompt.md](templates/openbot-routine-prompt.md). Copy its URL and signing secret.
+2. Run `~/.grokbot-hooks/set-webhook.sh <bot> openbot` and paste both when asked (the secret prompt is hidden). Run `./install.sh` again first if you installed an older version: it adds `openbot-sign.py`. OpenBot mode needs `python3` (macOS has it).
+3. Test with a small thread and watch `notify.log`: `webhook http=202 result=0 mode=openbot`.
+
+What OpenBot gets: `POST` with `Content-Type: application/json` and the body `{"type":"t3.callback","occurredAt":"<ISO 8601>","data":{...}}`. **The payload fields described under [Payload](docs/hooks.md#payload) are all inside `data`.** The headers are `x-openbot-timestamp` (Unix seconds), `x-openbot-delivery-id` (unique per event) and `x-openbot-signature: sha256=<hex HMAC-SHA256 of "<timestamp>.<delivery id>.<exact body bytes>" keyed with the signing secret>`.
+
+Details that matter:
+
+- **Every ping type uses it:** turn ends, approval prompts, the launchd sweep, stall and `turn_died` pings, and pings for routed sub-threads.
+- **Success is 200 or 202.** 200 means OpenBot had this delivery id already. After a failure the status is not recorded as sent, so a later turn or sweep tries again, as in Grok Bot mode. A 503 (host offline or busy) is retried once after one second, with the same delivery id and body; the hook never waits longer. 401, 404, 413 and 400 are logged as `http=<code>` and are not retried at once.
+- **Size:** the body stays under 64 KB (64,000 bytes). If it would not, `last_message` is shortened (`[truncated]`), then `my_open_threads` is dropped.
+- **The secret stays off the command line.** `hooks/openbot-sign.py` reads the secret, URL and payload from stdin and prints a curl config that curl also reads from stdin. The secret, the URL and the signature are never in a process argument (so not in `ps`), never in `notify.log` and never in the environment of the child processes. `notify.log` shows only the HTTP status. The secret lives only in the mode-600 env file.
+- **Clock:** OpenBot rejects a timestamp more than 300 seconds off its own clock (401). Keep the Mac's time synced.
 
 ## What's in here
 
@@ -98,7 +125,8 @@ hooks/config-lib.sh       shared parser for the optional config file and Claude 
 hooks/notify.sh           Stop hook, turn-start hook, approval-prompt pings and sweeps: reads marker + status, POSTs to the bot
 hooks/registry-lib.sh     thread registry (threads.sqlite): finds the T3 thread for each worktree, builds my_open_threads,
                           routes marker-less sub-threads to their parent's bot, lists T3's pending approvals
-hooks/set-webhook.sh      stores one bot's webhook URL + auth in a chmod 600 file
+hooks/set-webhook.sh      stores one bot's webhook (Grok Bot URL + auth, or OpenBot URL + signing secret) in a chmod 600 file
+hooks/openbot-sign.py     signs an OpenBot webhook request for notify.sh (secret via stdin, never argv)
 examples/config.example   optional local config (copy to ~/.grokbot-hooks/config)
 docs/t3-mcp-setup.md      connecting T3 Code's MCP to Grok Bot, and the tools bots use
 docs/hooks.md             hook config per harness, payload schema, debugging
@@ -110,6 +138,7 @@ docs/cli-setup.md         shared setup and limits for plain CLI sessions
 templates/cli-*.md        plain CLI task footer and callback routine
 docs/grokbot-side.md      webhook routine, brief additions, backup check, cleanup
 templates/routine-prompt.md   prompt for the "T3 callback" routine
+templates/openbot-routine-prompt.md   OpenBot webhook routine: setup and the wrapper line for the prompt
 templates/brief-footer.md     text to append to every brief sent to T3
 ```
 
@@ -291,7 +320,7 @@ Precedence: a real (non-empty) environment variable, then the config file, then 
 
 **One webhook and one key per bot.** Each bot has its own routine, URL and key, stored in its own `~/.grokbot-hooks/<bot>.env`. The marker names the bot, so the callback goes to the bot that launched the thread and no other.
 
-**Secrets stay in files on the machine.** Webhook URLs and keys live only in chmod 600 files under a chmod 700 directory, entered through a hidden prompt. They never go into briefs, prompts, chat or logs. The log records the HTTP status code only.
+**Secrets stay in files on the machine.** Webhook URLs, keys and OpenBot signing secrets live only in chmod 600 files under a chmod 700 directory, entered through a hidden prompt. They never go into briefs, prompts, chat or logs. The log records the HTTP status code only. In OpenBot mode the secret, URL and signature are also kept out of process arguments (see [OpenBot webhooks](#openbot-webhooks)).
 
 **A quiet backup check.** If a turn never ends, because the harness crashed or the machine went offline, no hook fires. Each bot keeps a low-frequency backup check (for example every hour or two) that looks at its open threads and stays silent unless something is stuck.
 

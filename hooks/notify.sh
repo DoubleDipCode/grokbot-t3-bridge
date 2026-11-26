@@ -61,15 +61,70 @@ route_reset() {
 }
 
 # post: POST the payload built from the globals BOT ROOT HARNESS BRANCH STATUS LAST TS SESSION
-# TRANSCRIPT SESSION_CWD ROUTE SUB_* PARENT_*, plus the registry's thread fields. Returns 0 on HTTP 2xx, 1 on failure, 2 when the bot has no webhook.
+# TRANSCRIPT SESSION_CWD ROUTE SUB_* PARENT_*, plus the registry's thread fields. Returns 0 on HTTP 2xx
+# (200 or 202 in OpenBot mode), 1 on failure, 2 when the bot has no usable webhook. Every ping type
+# (turn end, approval, sweep, routed sub-thread) goes through here, so both modes cover all of them.
+# The bot's env file picks the mode: GROKBOT_WEBHOOK_MODE unset or "grokbot" posts the bare payload
+# with the Authorization header; "openbot" posts it signed (see post_openbot). Anything else is refused.
+# The signing secret is cleared after every send and is never exported or put on a command line.
 post() {
-  local env="$DIR/$BOT.env" body http result
+  local rc
+  post_once
+  rc=$?
+  GROKBOT_WEBHOOK_SECRET=
+  return "$rc"
+}
+
+# post_openbot <payload json>: sign and send one OpenBot callback. Sets HTTP and RESULT.
+# hooks/openbot-sign.py gets the secret, the URL and the payload on stdin and prints a curl config
+# (URL, headers with the signature, body); curl reads that config from stdin as well, so neither the
+# secret, the URL nor the signature is ever in a process argument. One quick retry on 503 (host busy
+# or offline) with the same delivery id, so a retry of a delivered event is a duplicate, not a second one.
+post_openbot() {
+  local cfg rc
+  local signer="$DIR/openbot-sign.py"
+  local python
+  python="$(command -v python3 2>/dev/null || echo /usr/bin/python3)"
+  HTTP=000; RESULT=1
+  [ -f "$signer" ] && [ -x "$python" ] || { echo "$TS $BOT webhook openbot-no-signer" >> "$LOG"; return 1; }
+  cfg="$(printf '%s\n%s\n%s' "$GROKBOT_WEBHOOK_SECRET" "$GROKBOT_WEBHOOK_URL" "$1" | "$python" -I "$signer" 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$cfg" ]; then
+    echo "$TS $BOT webhook openbot-sign-failed rc=$rc" >> "$LOG"
+    return 1
+  fi
+  # -q: no ~/.curlrc (it could add tracing or headers). Errors go nowhere: they can contain the URL.
+  HTTP="$(printf '%s\n' "$cfg" | curl -q -sS -m 10 -K - 2>/dev/null)"
+  RESULT=$?
+  if [ "$RESULT" -eq 0 ] && [ "$HTTP" = 503 ]; then
+    sleep 1
+    HTTP="$(printf '%s\n' "$cfg" | curl -q -sS -m 10 -K - 2>/dev/null)"
+    RESULT=$?
+    echo "$TS $BOT webhook openbot-retry-503" >> "$LOG"
+  fi
+  return 0
+}
+
+post_once() {
+  local env="$DIR/$BOT.env" body http result mode
   [ -f "$env" ] || return 2
   GROKBOT_WEBHOOK_URL=
   GROKBOT_WEBHOOK_AUTH=
+  GROKBOT_WEBHOOK_MODE=
+  GROKBOT_WEBHOOK_SECRET=
+  # Even if the shell or the env file exports them, children (jq, git, curl, python3) must not inherit them.
+  export -n GROKBOT_WEBHOOK_URL GROKBOT_WEBHOOK_AUTH GROKBOT_WEBHOOK_SECRET
   # shellcheck disable=SC1090
   . "$env"
+  export -n GROKBOT_WEBHOOK_URL GROKBOT_WEBHOOK_AUTH GROKBOT_WEBHOOK_SECRET
   [ -n "$GROKBOT_WEBHOOK_URL" ] || return 2
+  mode="${GROKBOT_WEBHOOK_MODE:-grokbot}"
+  case "$mode" in
+    grokbot) ;;
+    openbot)
+      [ -n "$GROKBOT_WEBHOOK_SECRET" ] || { echo "$TS $BOT webhook openbot-no-secret" >> "$LOG"; return 2; } ;;
+    *) echo "$TS $BOT webhook unknown-mode" >> "$LOG"; return 2 ;;  # explicit modes only, never guessed
+  esac
   registry_load_thread "$ROOT"
   registry_summary "$BOT"
   body="$("$JQ" -n --arg bot "$BOT" --arg harness "$HARNESS" --arg worktree "$ROOT" \
@@ -86,6 +141,13 @@ post() {
     touch "$STATE/$KEY.stalled" || return 1
     # A dead turn is reported once per turn start, whatever happens to the status file.
     [ -z "${TURN_DEAD:-}" ] || write_epoch "$STATE/$KEY.turndead" "$TURN_START" || return 1
+  fi
+  if [ "$mode" = openbot ]; then
+    post_openbot "$body" || return 1
+    echo "$TS $BOT webhook http=$HTTP result=$RESULT mode=openbot" >> "$LOG"
+    # Accepted (202) or already delivered (200). Other 2xx codes are not part of the contract.
+    [ "$RESULT" -eq 0 ] && { [ "$HTTP" = 200 ] || [ "$HTTP" = 202 ]; }
+    return
   fi
   # Never log curl diagnostics: they can contain a secret URL.
   http="$(curl -sS -m 10 -X POST "$GROKBOT_WEBHOOK_URL" -H 'Content-Type: application/json' \

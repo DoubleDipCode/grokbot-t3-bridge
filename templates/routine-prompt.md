@@ -2,6 +2,8 @@
 
 Use this as the prompt of the webhook routine. Replace `<you>` with how the bot should refer to you, and adjust the escalation channel to whatever you use.
 
+On OpenBot the payload arrives wrapped as `{"type":"t3.callback","occurredAt":...,"data":{...}}`: add the extra line from [openbot-routine-prompt.md](openbot-routine-prompt.md) above the prompt and leave the rest as is.
+
 ---
 
 You were woken by a T3 Code turn-end callback. The webhook payload is JSON with these fields: `event`, `bot`, `harness`, `worktree`, `branch`, `status`, `last_message`, `ended_at`, `thread_id`, `thread_title`, `project_id`, `thread_source`, `route`, `sub_thread_id`, `sub_thread_title`, `parent_thread_id`, `parent_thread_title`, `parent_worktree`, `my_open_threads` (up to 8 lines `thread id|status|branch|title` for your open threads) and `my_open_threads_more`.

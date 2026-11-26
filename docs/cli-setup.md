@@ -19,8 +19,8 @@ From this repo, after review:
 mkdir -p "$HOME/.grokbot-hooks"
 chmod 700 "$HOME/.grokbot-hooks"
 # Back up existing scripts before replacing them.
-cp hooks/notify.sh hooks/set-webhook.sh "$HOME/.grokbot-hooks/"
-chmod 700 "$HOME/.grokbot-hooks/notify.sh" "$HOME/.grokbot-hooks/set-webhook.sh"
+cp hooks/notify.sh hooks/set-webhook.sh hooks/openbot-sign.py "$HOME/.grokbot-hooks/"
+chmod 700 "$HOME/.grokbot-hooks/notify.sh" "$HOME/.grokbot-hooks/set-webhook.sh" "$HOME/.grokbot-hooks/openbot-sign.py"
 ```
 
 Add only the Stop entry in your selected guide. Back up the settings file first.
@@ -38,7 +38,9 @@ Authorization header on the agent machine:
 ~/.grokbot-hooks/set-webhook.sh mybot
 ```
 
-Enter credentials in that terminal only. Do not put them in chat or git.
+Choose `grokbot` (URL and Authorization header) or `openbot` (URL and signing
+secret; see [OpenBot webhooks](../README.md#openbot-webhooks)). Enter credentials
+in that terminal only. Do not put them in chat or git.
 
 ## Start a task
 
