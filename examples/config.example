@@ -51,3 +51,9 @@
 # Minutes a request may wait in T3 (an approval prompt or a question) before the sweep pings once
 # for it (default 10; 0 turns this off).
 # GROKBOT_APPROVAL_MINUTES=10
+
+# Atoll (docs/atoll.md). Off unless an organization and a bot list are set.
+# GROKBOT_ATOLL_ORG=<organization id>
+# GROKBOT_ATOLL_SHADOW_BOTS="bot-a bot-b"
+# GROKBOT_ATOLL_LIVE_BOTS=""
+# GROKBOT_ATOLL_URL=https://atollhq.com
