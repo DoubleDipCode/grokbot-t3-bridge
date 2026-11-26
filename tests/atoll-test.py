@@ -14,10 +14,13 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 
 REPO = Path(__file__).resolve().parents[1]
 KEY = 'sk_test_fake_key_not_real'
 atoll_events, direct, report = [], [], {}
+wakes = []
+direct_entered, release_direct = threading.Event(), threading.Event()
 mode = {'atoll': 'forward'}
 
 
@@ -37,7 +40,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         if self.path == '/callback':
             direct.append(body)
-            return self.reply(200, {})
+            if mode.get('block_direct'):
+                direct_entered.set()
+                assert release_direct.wait(15), 'direct response not released'
+            code = mode.get('direct', 200)
+            if 200 <= code < 300:
+                wakes.append(body.get('atoll', {}).get('event_id'))
+            return self.reply(code, {})
         assert self.path == '/api/orgs/org-1/agent-events', self.path
         assert self.headers['Authorization'] == 'Bearer ' + KEY
         how = mode['atoll']
@@ -50,7 +59,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Recorded, but the answer never reaches the hook.
             time.sleep(5)
             return None
+        # Deliberately do not implement fallback_delivered or event-id dedupe here. The hook
+        # must itself make an acknowledged fallback's replay record-only.
         forwarded = how == 'forward' and body['deliver']
+        if forwarded:
+            wakes.append(body['event_id'])
         reason = 'forwarded' if forwarded else ('shadow' if not body['deliver'] else 'no_route')
         return self.reply(202, {'event_id': body['event_id'], 'forwarded': forwarded, 'reason': reason})
 
@@ -97,10 +110,12 @@ with tempfile.TemporaryDirectory(prefix='grokbot-atoll-') as temp:
     def completed():
         return log.read_text().count('worker-complete') if log.exists() else 0
 
-    def turn(status, status_name='.atoll-status', harness='claude', session='session-1'):
+    session_id = str(uuid.uuid4())
+
+    def turn(status, status_name='.atoll-status', harness='claude', session=session_id, message='Last words'):
         (work / status_name).write_text(status)
         before = completed()
-        payload = {'cwd': str(work), 'session_id': session, 'last_assistant_message': 'Last words'}
+        payload = {'cwd': str(work), 'session_id': session, 'last_assistant_message': message}
         subprocess.run(['bash', str(REPO / 'hooks/notify.sh'), harness], input=json.dumps(payload),
                        text=True, env=env, cwd=root, check=True, capture_output=True)
         deadline = time.monotonic() + 30
@@ -134,7 +149,7 @@ with tempfile.TemporaryDirectory(prefix='grokbot-atoll-') as temp:
     event = atoll_events[0]
     assert event['deliver'] is False and direct[0]['atoll']['event_id'] == event['event_id']
     assert event['alias'] == 'test' and event['issue'] == 'AP-12' and event['harness'] == 'claude'
-    assert event['thread']['id'] == 'session-1' and event['pr_url'] == 'https://github.com/o/r/pull/7'
+    assert event['thread']['id'] == session_id and event['pr_url'] == 'https://github.com/o/r/pull/7'
     assert event['kind'] == 'turn_ended' and event['excerpt'] == 'Last words' and event['occurred_at'].endswith('Z')
     assert not {'worktree', 'cwd', 'transcript_path'} & set(event) and str(work) not in json.dumps(event)
     assert not spooled()
@@ -159,6 +174,7 @@ with tempfile.TemporaryDirectory(prefix='grokbot-atoll-') as temp:
     assert len(direct) == 1 and len(atoll_events) == 2, (direct, atoll_events)
     assert atoll_events[1]['event_id'] == atoll_events[0]['event_id'] == direct[0]['atoll']['event_id']
     assert atoll_events[1]['fallback_delivered'] is True and not spooled()
+    assert atoll_events[1]['deliver'] is False
 
     # Atoll down: direct and spooled; it replays when Atoll is back.
     reset()
@@ -172,6 +188,85 @@ with tempfile.TemporaryDirectory(prefix='grokbot-atoll-') as temp:
     assert not direct
     replayed = [e for e in atoll_events if e['event_id'] == down_id]
     assert len(replayed) == 1 and replayed[0]['fallback_delivered'] is True and not spooled(), atoll_events
+    assert wakes.count(down_id) == 1, 'replay woke an acknowledged fallback twice'
+
+    # Real --sweep drains the spool too, without a second wake. Secret-bearing status and
+    # excerpts must not reach any spool file, including the temporary file before rename.
+    reset()
+    mode['atoll'] = 'error'
+    placeholder = uuid.uuid4().hex
+    env['REVIEW_TEST_ENV_VALUE'] = placeholder
+    turn('done ' + placeholder, message=placeholder + ' ' + KEY)
+    saved_id = direct[0]['atoll']['event_id']
+    assert len(spooled()) == 1
+    saved = json.loads(spooled()[0].read_text())
+    assert saved['status'] == 'done' and saved['deliver'] is False
+    assert saved['fallback_delivered'] is True
+    assert not {'excerpt', 'branch', 'pr_url', 'issue'} & saved.keys()
+    assert saved['thread'] == {'id': session_id}
+    for file in spool.iterdir():
+        data = file.read_text()
+        assert placeholder not in data and KEY not in data, 'credential reached spool'
+    mode['atoll'] = 'forward'
+    subprocess.run(['bash', str(REPO / 'hooks/notify.sh'), '--sweep'], env=env, cwd=root,
+                   check=True, capture_output=True)
+    assert not spooled() and wakes.count(saved_id) == 1, 'sweep repeated direct wake'
+
+    # Shadow and suppressed turn-end failures use the same safe spool writer.
+    mode['atoll'] = 'error'
+    flip('shadow')
+    turn('done shadow ' + placeholder, message=placeholder)
+    turn('waiting ' + placeholder, message=placeholder)
+    assert len(spooled()) == 2
+    for file in spool.iterdir():
+        data = file.read_text()
+        assert placeholder not in data and KEY not in data, 'record/shadow credential reached spool'
+        assert json.loads(data)['deliver'] is False
+    flip('live')
+    mode['atoll'] = 'forward'
+    turn('waiting cleanup')
+    assert not spooled()
+
+    # Both destinations down: preserve deliver:true so sweep can perform the first wake.
+    reset()
+    mode.update(atoll='error', direct=500)
+    turn('done both down')
+    undelivered_id = direct[0]['atoll']['event_id']
+    saved = json.loads(spooled()[0].read_text())
+    assert saved['deliver'] is True and saved['fallback_delivered'] is False
+    mode.update(atoll='forward', direct=200)
+    subprocess.run(['bash', str(REPO / 'hooks/notify.sh'), '--sweep'], env=env, cwd=root,
+                   check=True, capture_output=True)
+    assert not spooled() and wakes.count(undelivered_id) == 1
+
+    # Approval posts bypass the worker lock. A concurrent sweep must not see their
+    # event before the direct acknowledgement has set fallback_delivered.
+    reset()
+    mode.update(atoll='error', block_direct=True)
+    payload = dict(cwd=str(work), session_id=session_id, notification_type='permission_prompt',
+                   message='Permission needed')
+    before = completed()
+    subprocess.run(['bash', str(REPO / 'hooks/notify.sh'), 'claude-notify'],
+                   input=json.dumps(payload), text=True, env=env, cwd=root,
+                   check=True, capture_output=True)
+    assert direct_entered.wait(15), 'approval did not reach direct post'
+    assert not spooled(), 'event exposed to sweep before direct acknowledgement'
+    try:
+        subprocess.run(['bash', str(REPO / 'hooks/notify.sh'), '--sweep'], env=env, cwd=root,
+                       check=True, capture_output=True)
+        assert not spooled(), 'sweep found an in-flight direct event'
+    finally:
+        release_direct.set()
+    deadline = time.monotonic() + 15
+    while completed() < before + 2:
+        assert time.monotonic() < deadline, 'approval did not finish'
+        time.sleep(0.05)
+    mode.update(atoll='forward', block_direct=False)
+    approval_id = direct[0]['atoll']['event_id']
+    assert json.loads(spooled()[0].read_text())['fallback_delivered'] is True
+    subprocess.run(['bash', str(REPO / 'hooks/notify.sh'), '--sweep'], env=env, cwd=root,
+                   check=True, capture_output=True)
+    assert not spooled() and wakes.count(approval_id) == 1
 
     # Lost response: the 4 s timeout gives a direct copy with the same id.
     reset()

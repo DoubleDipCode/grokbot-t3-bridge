@@ -153,11 +153,50 @@ hook_now_us() {
 }
 
 # atoll_spool <event json> <fallback delivered true|false>
+# Persist only routing identifiers and closed-vocabulary state. In particular, never persist
+# status notes, excerpts, titles, branches, URLs, host names or arbitrary extra payload fields:
+# any of them can contain credentials (including ones without a recognisable key prefix).
+# Harness thread/session ids must be UUIDs; an unrecognised identity goes direct only.
 atoll_spool() {
-  local id
+  local id safe
+  # Keep credential values on pipes, never in process arguments. Check the configured
+  # credentials too, in case one is accidentally used as a routing identifier. The env
+  # file is already trusted shell input to post_once; isolate it from this caller.
+  safe="$( {
+    printf '%s\n' "$1"
+    (
+      atoll_key || true
+      printf '\n'
+      # shellcheck disable=SC1090 # Same per-bot config as post_once, in a subshell.
+      [ ! -f "$DIR/${BOT:-}.env" ] || . "$DIR/$BOT.env" >/dev/null 2>&1
+      printf '%s\n' "${GROKBOT_WEBHOOK_URL:-}" "${GROKBOT_WEBHOOK_AUTH:-}" "${GROKBOT_WEBHOOK_SECRET:-}"
+    ) | "$JQ" -Rsc 'split("\n") | map(select(length > 0))
+      | . + map(sub("^[Bb]earer +"; ""))'
+  } | "$JQ" -ces --argjson delivered "$2" '
+    def uuid: type == "string" and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
+    .[0] as $event
+    | (.[1] + [env | to_entries[]
+        | select(.key != "T3CODE_THREAD_ID" and (.value | length) >= 8) | .value]) as $private
+    | select($delivered | type == "boolean")
+    | $event
+    | select((.event_id | uuid) and (.thread.id | uuid))
+    | select(.alias | type == "string" and test("^[a-z0-9_-]{1,64}$"))
+    | select(.kind == "turn_ended" or .kind == "approval" or .kind == "sweep")
+    | select(.route == "marker" or .route == "map" or .route == "parent" or .route == "project")
+    | select(.harness == "t3" or .harness == "claude" or .harness == "codex" or .harness == "cli")
+    | select(.seq | type == "number" and . >= 0 and floor == .)
+    | select(.occurred_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"))
+    | {event_id, kind, alias, route, harness, thread: {id: .thread.id}, occurred_at, seq,
+       status: ((.status | split(" ")[0] | split("\n")[0]) as $word
+         | if (["done", "needs_input", "failed", "waiting", "idle", "running", "milestone",
+                "stalled", "stale", "worktree_missing", "turn_ended_no_status"] | index($word))
+           then $word else "turn_ended_no_status" end),
+       deliver: (.deliver == true and ($delivered | not)), fallback_delivered: $delivered}
+    | select([.. | strings] | all(. as $value | $private | all(. as $secret | $value | contains($secret) | not)))' 2>/dev/null
+  )" && [ -n "$safe" ] || return 1
   mkdir -p "$ATOLL_SPOOL" 2>/dev/null || return 1
-  id="$(printf '%s' "$1" | "$JQ" -r '.event_id')"
-  printf '%s' "$1" | "$JQ" -c --argjson delivered "$2" '.fallback_delivered = $delivered' > "$ATOLL_SPOOL/.$id.tmp" \
+  id="$(printf '%s' "$safe" | "$JQ" -r '.event_id')"
+  printf '%s' "$safe" > "$ATOLL_SPOOL/.$id.tmp" \
     && mv -f "$ATOLL_SPOOL/.$id.tmp" "$ATOLL_SPOOL/$id.json"
 }
 
@@ -174,7 +213,8 @@ atoll_replay() {
     [ -f "$file" ] || continue
     [ "$count" -lt 10 ] || break
     count=$((count + 1))
-    atoll_send "$(cat "$file")"
+    # Honour the marker locally as well as at the receiver, including older spool records.
+    atoll_send "$("$JQ" -c 'if .fallback_delivered == true then .deliver = false else . end' "$file")"
     echo "$(date '+%Y-%m-%dT%H:%M:%S%z') atoll replay event_id=${name%.json} http=$ATOLL_HTTP" >> "$LOG"
     if atoll_retryable "$ATOLL_HTTP"; then break; fi
     # Accepted, or refused in a way a retry cannot fix.

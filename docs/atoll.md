@@ -69,6 +69,13 @@ runs and the sweep replay up to ten, oldest first, with `fallback_delivered`
 set when the direct post worked. A refusal such as 400, 403 or 404 is not
 spooled. Files older than seven days are deleted.
 
+The spool stores only event/routing identifiers, time, sequence, delivery flags and a
+known status word. It omits status notes, message excerpts, titles, host names,
+parent/project metadata, issues, branches, URLs and all extra payload fields. Thread
+and session ids must be UUIDs to enter the spool; other identities can still be sent
+live or direct, but cannot be replayed. A replay after an acknowledged direct post
+has both `fallback_delivered: true` and `deliver: false`, so it cannot wake the bot.
+
 ## Shadow comparison
 
 ```bash
