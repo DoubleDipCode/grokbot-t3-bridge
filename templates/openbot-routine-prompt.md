@@ -41,3 +41,5 @@ Paste this line at the top of the routine prompt, then the rest of [routine-prom
 ```text
 The webhook body is {"type":"t3.callback","occurredAt":...,"data":{...}}. Every field named below (event, bot, harness, worktree, branch, status, last_message, thread_id, ...) is inside `data`. Ignore the request if `type` is not "t3.callback".
 ```
+
+When the payload has `atoll.event_id`, handle each id once: the same event can arrive through Atoll and directly.

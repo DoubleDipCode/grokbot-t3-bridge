@@ -130,7 +130,7 @@ SQL
       bot="$(printf '%s' "$bot" | tr -cd 'a-z0-9_-')"
       [ -n "$bot" ] || continue
       if [ -d "$path" ]; then
-        word="$(head -n1 "$path/.grokbot-status" 2>/dev/null | awk '{print $1}' | head -c 40)"
+        word="$(head -n1 "$(status_file "$path")" 2>/dev/null | awk '{print $1}' | head -c 40)"
         [ -n "$word" ] || word=turn_ended_no_status
         branch="$(git -C "$path" branch --show-current 2>/dev/null)"
       else
@@ -194,7 +194,7 @@ registry_record() {
   case "$mode" in
     start) started=$((ev / 1000000)) ;;
     turn) ;;
-    *) mtime="$(perl -MTime::HiRes=stat -e 'my @s = stat($ARGV[0]); printf "%d", @s ? $s[9] * 1000000 : 0' "$ROOT/.grokbot-status" 2>/dev/null)"
+    *) mtime="$(perl -MTime::HiRes=stat -e 'my @s = stat($ARGV[0]); printf "%d", @s ? $s[9] * 1000000 : 0' "$(status_file "$ROOT")" 2>/dev/null)"
        case "$mtime" in *[!0-9]*|'') mtime=0 ;; esac ;;
   esac
   set="bot=$q_bot, branch=COALESCE(NULLIF($q_branch,''),branch)"
@@ -427,8 +427,8 @@ reg_wt_bot() {
   local wt="$1" b=
   WT_BOT=; WT_ROUTE=
   [ -n "$wt" ] || return 1
-  if [ -f "$wt/.grokbot" ]; then
-    b="$(head -n1 "$wt/.grokbot" 2>/dev/null | tr -cd 'a-z0-9_-')"
+  if has_marker "$wt"; then
+    b="$(marker_bot "$wt")"
     [ -z "$b" ] || [ ! -f "$DIR/$b.env" ] || { WT_BOT="$b"; WT_ROUTE=marker; return 0; }
   fi
   b="$(awk -F'\t' -v r="$wt" '$1==r {b=$2} END{print b}' "$MAP" 2>/dev/null | tr -cd 'a-z0-9_-')"

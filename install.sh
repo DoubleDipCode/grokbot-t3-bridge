@@ -17,6 +17,8 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$DEST"
 chmod 700 "$DEST"
 cp "$SRC/hooks/notify.sh" "$SRC/hooks/set-webhook.sh" "$SRC/hooks/config-lib.sh" "$SRC/hooks/registry-lib.sh" "$SRC/hooks/openbot-sign.py" "$DEST/"
+cp "$SRC/hooks/atoll-lib.sh" "$SRC/hooks/set-atoll-key.sh" "$SRC/hooks/atoll-shadow-compare.sh" "$DEST/"
+chmod 700 "$DEST/atoll-lib.sh" "$DEST/set-atoll-key.sh" "$DEST/atoll-shadow-compare.sh"
 chmod 700 "$DEST/notify.sh" "$DEST/set-webhook.sh" "$DEST/config-lib.sh" "$DEST/registry-lib.sh" "$DEST/openbot-sign.py"
 echo "Installed scripts to $DEST"
 # The optional local config ($DEST/config) is never created or overwritten here.

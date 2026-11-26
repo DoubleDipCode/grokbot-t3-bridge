@@ -28,6 +28,13 @@ follow their linked guide and [shared CLI setup](docs/cli-setup.md).
 
 You don't have to trust the code in this repo. [ONE-SHOT-PROMPT.md](ONE-SHOT-PROMPT.md) is a single prompt you can paste into your own Grok Bot, or any agent with shell access to your agent machine. It describes the whole setup as a spec, so your agent writes its own version, shows you every file before installing, and leaves the secrets for you to enter yourself.
 
+## Optional: send events through Atoll
+
+With [Atoll](docs/atoll.md) the hook reports each ping there first and keeps the
+direct post as the fallback. The marker can then be `.atoll` with the issue the
+thread works on, and the status file `.atoll-status`. The old `.grokbot` names
+keep working.
+
 ## The problem
 
 Without a callback, a bot that launches a T3 thread has no way to know when the work is done. In practice ours ended up waiting on threads in 10-minute stretches and re-reading the thread activity each time. That burned tokens on reading the same messages over and over, and it still missed stalls: a thread that stopped to ask a question could sit for a long time before anyone noticed.
