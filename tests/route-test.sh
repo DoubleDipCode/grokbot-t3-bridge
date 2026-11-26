@@ -88,7 +88,7 @@ db_thread lone-agent proj-1 'Agent thread without parent' "$WX" - agent mcp
 printf '%s\torcy\n' "$WP" > "$GROKBOT_HOOKS_DIR/markers.tsv"
 
 # A ping ends with worker-complete; a prompt that cannot be routed ends with a no-marker line.
-ends() { echo $(( $(grep -c 'worker-complete\|no-marker' "$LOGF" || true) )); }
+ends() { echo $(( $(grep -c 'worker-complete\|no-marker\|instant approvals off' "$LOGF" || true) )); }
 waitdone() { # <ends() before>
   local i
   for ((i=0; i<500; i++)); do
@@ -301,6 +301,30 @@ grep -q 'route-lookup-failed approval thread=lone2' "$LOGF" || fail 'registry fa
 sweep
 count 1
 [ "$(last .route)" = project ] && [ "$(last .thread_id)" = lone2 ] || fail "lone2 after registry recovered: $(tail -n1 "$CALLS")"
+
+# --- 9h. GROKBOT_INSTANT_APPROVAL=0 in <bot>.env drops only the instant Codex permission ping. ---
+: > "$CALLS"
+cp "$GROKBOT_HOOKS_DIR/orcy.env" "$TMP/orcy.env.orig"
+approve "$WP" parent codex-permission                    # line absent: sent as before
+count 1
+echo 'GROKBOT_INSTANT_APPROVAL=1' >> "$GROKBOT_HOOKS_DIR/orcy.env"
+approve "$WP" parent codex-permission                    # any other value: sent
+count 2
+cp "$TMP/orcy.env.orig" "$GROKBOT_HOOKS_DIR/orcy.env"
+echo 'GROKBOT_INSTANT_APPROVAL=0' >> "$GROKBOT_HOOKS_DIR/orcy.env"
+approve "$WP" parent codex-permission                    # marked worktree: skipped
+approve "$WB" builder-b codex-permission                 # routed sub-thread: skipped too
+count 2
+grep -q 'orcy codex-permission skipped (instant approvals off)' "$LOGF" || fail 'skip not logged'
+approve "$WP" parent                                     # Claude Code prompts are not affected
+count 3
+[ "$(last .harness)" = claude-notify ] || fail "claude-notify with opt-out: $(tail -n1 "$CALLS")"
+sqlite3 "$GROKBOT_T3_DB" "UPDATE orchestration_v2_projection_runtime_requests SET status='resolved';"  # earlier ones age past 10m during the run
+db_request req-optout builder-b command pending 40       # really pending in T3: the sweep still reports it
+sweep
+count 4
+[ "$(last .status)" = 'stalled 40m approval_pending command' ] || fail "sweep with opt-out: $(tail -n1 "$CALLS")"
+cp "$TMP/orcy.env.orig" "$GROKBOT_HOOKS_DIR/orcy.env"
 
 # --- 10. Without registry-lib.sh nothing routes and nothing breaks. ---
 : > "$CALLS"

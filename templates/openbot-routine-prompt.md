@@ -14,7 +14,8 @@ Use this when the bot runs on OpenBot instead of Grok Bot. The hook, the marker,
 
    Answer `openbot`, paste the URL, then paste the signing secret. Both prompts hide your input. This writes `~/.grokbot-hooks/<bot-name>.env` (mode 600) with `GROKBOT_WEBHOOK_MODE=openbot`, `GROKBOT_WEBHOOK_URL` and `GROKBOT_WEBHOOK_SECRET`. The mode is always explicit: an env file with no `GROKBOT_WEBHOOK_MODE` is a Grok Bot webhook.
 4. `python3` must be on the machine (`hooks/openbot-sign.py` signs the request). macOS has it.
-5. Test: have the bot launch a small thread and watch `~/.grokbot-hooks/notify.log`. A delivered callback logs `webhook http=202 result=0 mode=openbot` (`http=200` means OpenBot had already received that event).
+5. Recommended for a bot whose T3 threads run in Auto mode: add the line `GROKBOT_INSTANT_APPROVAL=0` to `~/.grokbot-hooks/<bot-name>.env` (again after each `set-webhook.sh` run, which rewrites the file). It drops the instant Codex permission pings; requests that really wait in T3 are still reported after about 10 minutes. See [the limits](../docs/hooks.md#turning-off-the-instant-codex-pings-for-one-bot).
+6. Test: have the bot launch a small thread and watch `~/.grokbot-hooks/notify.log`. A delivered callback logs `webhook http=202 result=0 mode=openbot` (`http=200` means OpenBot had already received that event).
 
 Never paste the URL or the signing secret into a chat, a brief or a prompt.
 

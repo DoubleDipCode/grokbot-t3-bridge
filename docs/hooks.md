@@ -121,6 +121,20 @@ Claude `notification_type` values that count as approval or input: `permission_p
 
 **Codex `notify`:** Codex's `notify` setting supports only `agent-turn-complete`; `approval-requested` exists only for its built-in TUI notifications. Use the `PermissionRequest` hook instead. It may also fire for requests that Codex's auto-review then approves, so an occasional ping needs no action.
 
+### Turning off the instant Codex pings for one bot
+
+In T3 Auto mode the Codex `PermissionRequest` hook can fire many times in one run for requests that T3 then approves itself. To stop those pings for one bot, add this line to `~/.grokbot-hooks/<bot>.env`:
+
+```text
+GROKBOT_INSTANT_APPROVAL=0
+```
+
+- The line must be exactly that: no `export`, quotes, spaces or trailing comment. Without it (or with any other value) every ping is sent, as before.
+- It drops only `codex-permission` pings, including those for sub-threads routed to this bot. `notify.log` shows `<bot> codex-permission skipped (instant approvals off)`. A skipped ping also does not update the thread registry. `claude-notify` pings are still sent.
+- Requests that are really waiting in T3 are still reported by the [pending-approvals sweep](#the-pending-approvals-sweep), after `GROKBOT_APPROVAL_MINUTES` (default 10). The sweep runs with other hook runs or from the optional launchd job, so install that job if nothing else may be running.
+- Do not use it where the sweep cannot see the prompt: Codex outside T3, `GROKBOT_APPROVAL_MINUTES=0`, `GROKBOT_REGISTRY=0` or `GROKBOT_T3_DB_LOOKUP=0`.
+- `set-webhook.sh` rewrites the env file, so add the line again after you run it.
+
 Checked on 2026-11-04 against the [Claude hooks reference](https://code.claude.com/docs/en/hooks) and the [Codex hooks reference](https://developers.openai.com/codex/hooks); the installed codex-cli 0.166.0 binary knows the `PermissionRequest` event.
 
 ### Stall fallback in the sweep
@@ -298,6 +312,7 @@ What the log lines mean:
 | `... status=worktree_missing worktree /path ...` | Known worktree, marker gone. The bot was notified and should read the thread. |
 | `... codex bot=codexbot branch=... status=done` | Hook ran in a bot worktree. |
 | `... codexbot webhook http=200` | Callback delivered. |
+| `... codexbot codex-permission skipped (instant approvals off)` | The env file has `GROKBOT_INSTANT_APPROVAL=0`, so this instant ping was [not sent](#turning-off-the-instant-codex-pings-for-one-bot). |
 | `... codexbot webhook http=401` | Wrong or missing Authorization value. Run `set-webhook.sh` again. In OpenBot mode (`mode=openbot` at the end of the line): wrong signing secret, or the Mac's clock is more than 5 minutes off. |
 | `... codexbot webhook http=202 result=0 mode=openbot` | OpenBot accepted the callback (`http=200` there: it had that delivery id already). |
 | `... codexbot webhook openbot-retry-503` | OpenBot said 503 (host offline or busy); the hook tried once more after a second. The next `webhook http=` line is the retry's result. |

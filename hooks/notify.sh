@@ -660,6 +660,12 @@ approval() {
       exit 0
     fi
   fi
+  # Per-bot opt-out: GROKBOT_INSTANT_APPROVAL=0 in <bot>.env drops instant Codex permission pings
+  # (T3 Auto mode approves most of them itself); the sweep still reports requests really pending in T3.
+  if [ "$HARNESS" = codex-permission ] && grep -qx 'GROKBOT_INSTANT_APPROVAL=0' "$DIR/$bot.env" 2>/dev/null; then
+    echo "$TS $bot codex-permission skipped (instant approvals off)" >> "$LOG"
+    exit 0
+  fi
   BOT="$bot"
   ROOT="$root"
   SESSION="$SESSION_ID"
