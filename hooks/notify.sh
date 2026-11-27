@@ -35,6 +35,52 @@ REG_ENV_THREAD="${T3CODE_THREAD_ID:-}"
 # Prefer jq from PATH, fall back to /usr/bin/jq. Hooks often run with a minimal PATH.
 JQ="$(command -v jq 2>/dev/null || echo /usr/bin/jq)"
 
+# Marker and status files. `.atoll` ({"agent":"name","issue":"AP-1"}) and `.atoll-status` are the
+# current names; `.grokbot` and `.grokbot-status` stay readable while bots move over. A worktree
+# whose `.atoll` is a folder (Atoll CLI context) keeps the marker in `.atoll/marker.json`.
+atoll_marker_file() {
+  if [ -d "$1/.atoll" ]; then
+    [ ! -f "$1/.atoll/marker.json" ] || printf '%s' "$1/.atoll/marker.json"
+  elif [ -f "$1/.atoll" ]; then
+    printf '%s' "$1/.atoll"
+  fi
+}
+marker_file() {
+  local f
+  f="$(atoll_marker_file "$1")"
+  if [ -n "$f" ] && [ -n "$("$JQ" -r '.agent | strings' "$f" 2>/dev/null)" ]; then
+    printf '%s' "$f"
+  elif [ -f "$1/.grokbot" ]; then
+    printf '%s' "$1/.grokbot"
+  fi
+}
+has_marker() { [ -n "$(marker_file "$1")" ]; }
+# Bot name is sanitised so it can only ever point at a file inside $DIR.
+marker_bot() {
+  local f
+  f="$(marker_file "$1")"
+  case "$f" in
+    '') ;;
+    */.grokbot) head -n1 "$f" 2>/dev/null | tr -cd 'a-z0-9_-' ;;
+    *) "$JQ" -r '.agent | strings' "$f" 2>/dev/null | head -n1 | tr -cd 'a-z0-9_-' ;;
+  esac
+}
+marker_issue() {
+  local f
+  f="$(atoll_marker_file "$1")"
+  [ -z "$f" ] || "$JQ" -r '.issue | strings' "$f" 2>/dev/null | head -n1 | tr -cd 'A-Za-z0-9#-' | head -c 64
+}
+status_file() {
+  if [ -f "$1/.atoll-status" ]; then printf '%s' "$1/.atoll-status"; else printf '%s' "$1/.grokbot-status"; fi
+}
+
+# Atoll (docs/atoll.md). Optional: without atoll-lib.sh next to this script every ping goes direct.
+# shellcheck source=hooks/atoll-lib.sh
+[ ! -f "$DIR/atoll-lib.sh" ] || . "$DIR/atoll-lib.sh" || true
+if ! type atoll_mode >/dev/null 2>&1; then
+  atoll_mode() { printf off; }; atoll_replay() { :; }; atoll_record() { :; }
+fi
+
 # Thread registry (threads.sqlite). Optional: without registry-lib.sh next to this script the
 # payload simply has no thread fields. Every registry call is best effort and never blocks a ping.
 # shellcheck source=hooks/registry-lib.sh
@@ -60,6 +106,15 @@ route_reset() {
   ROUTE=; ROUTE_BOT=; SUB_ID=; SUB_TITLE=; SUB_ROOT=; PARENT_ID=; PARENT_TITLE=; PARENT_ROOT=
 }
 
+# record_only: tell Atoll about a turn end that the bot is not pinged for. Sweeps repeat the same
+# status many times, so only a real turn end counts.
+record_only() {
+  [ "$HARNESS" != sweep ] && has_marker "$ROOT" || return 0
+  BRANCH="$(git -C "$ROOT" branch --show-current 2>/dev/null)"
+  atoll_record
+  return 0
+}
+
 # post: POST the payload built from the globals BOT ROOT HARNESS BRANCH STATUS LAST TS SESSION
 # TRANSCRIPT SESSION_CWD ROUTE SUB_* PARENT_*, plus the registry's thread fields. Returns 0 on HTTP 2xx
 # (200 or 202 in OpenBot mode), 1 on failure, 2 when the bot has no usable webhook. Every ping type
@@ -68,11 +123,26 @@ route_reset() {
 # with the Authorization header; "openbot" posts it signed (see post_openbot). Anything else is refused.
 # The signing secret is cleared after every send and is never exported or put on a command line.
 post() {
-  local rc
-  post_once
+  local rc mode
+  mode="$(atoll_mode "$BOT")"
+  if [ "$mode" = off ]; then
+    post_once ""
+  else
+    post_atoll "$mode"
+  fi
   rc=$?
   GROKBOT_WEBHOOK_SECRET=
   return "$rc"
+}
+
+# Record stall attempts only once a payload and a destination are available.
+# At most one request per revision, even on HTTP failure or worker crash.
+mark_stall_attempt() {
+  if [ "$HARNESS" = sweep ] && [[ "$STATUS" = stalled\ * ]] && [ -z "${NO_STALL_MARK:-}" ]; then
+    touch "$STATE/$KEY.stalled" || return 1
+    # A dead turn is reported once per turn start, whatever happens to the status file.
+    [ -z "${TURN_DEAD:-}" ] || write_epoch "$STATE/$KEY.turndead" "$TURN_START" || return 1
+  fi
 }
 
 # post_openbot <payload json>: sign and send one OpenBot callback. Sets HTTP and RESULT.
@@ -105,8 +175,10 @@ post_openbot() {
   return 0
 }
 
+# post_once <Atoll event id or "">: the direct post. With an id, the body carries
+# atoll.event_id, the same id as Atoll's own delivery, so a receiver can drop the repeat.
 post_once() {
-  local env="$DIR/$BOT.env" body http result mode
+  local env="$DIR/$BOT.env" body http result mode event_id="${1:-}"
   [ -f "$env" ] || return 2
   GROKBOT_WEBHOOK_URL=
   GROKBOT_WEBHOOK_AUTH=
@@ -133,15 +205,9 @@ post_once() {
     --arg thread_id "${THREAD_ID:-}" --arg thread_title "${THREAD_TITLE:-}" --arg project_id "${PROJECT_ID:-}" \
     --arg thread_source "${THREAD_SOURCE:-}" --arg route "${ROUTE:-}" --arg sub_thread_id "${SUB_ID:-}" --arg sub_thread_title "${SUB_TITLE:-}" \
     --arg parent_thread_id "${PARENT_ID:-}" --arg parent_thread_title "${PARENT_TITLE:-}" --arg parent_worktree "${PARENT_ROOT:-}" \
-    --argjson open_threads "${SUMMARY_JSON:-[]}" --argjson open_more "${SUMMARY_MORE:-0}" \
-    '{event:"t3_turn_ended",bot:$bot,harness:$harness,worktree:$worktree,branch:$branch,status:$status,last_message:$last,ended_at:$ts,cwd:$cwd,session_id:$session,transcript_path:$transcript,thread_id:$thread_id,thread_title:$thread_title,project_id:$project_id,thread_source:$thread_source,route:$route,sub_thread_id:$sub_thread_id,sub_thread_title:$sub_thread_title,parent_thread_id:$parent_thread_id,parent_thread_title:$parent_thread_title,parent_worktree:$parent_worktree,my_open_threads:$open_threads,my_open_threads_more:$open_more}')" || return 1
-  # Record stall attempts only once a payload and webhook are available.
-  # At most one request per revision, even on HTTP failure or worker crash.
-  if [ "$HARNESS" = sweep ] && [[ "$STATUS" = stalled\ * ]] && [ -z "${NO_STALL_MARK:-}" ]; then
-    touch "$STATE/$KEY.stalled" || return 1
-    # A dead turn is reported once per turn start, whatever happens to the status file.
-    [ -z "${TURN_DEAD:-}" ] || write_epoch "$STATE/$KEY.turndead" "$TURN_START" || return 1
-  fi
+    --argjson open_threads "${SUMMARY_JSON:-[]}" --argjson open_more "${SUMMARY_MORE:-0}" --arg event_id "$event_id" \
+    '{event:"t3_turn_ended",bot:$bot,harness:$harness,worktree:$worktree,branch:$branch,status:$status,last_message:$last,ended_at:$ts,cwd:$cwd,session_id:$session,transcript_path:$transcript,thread_id:$thread_id,thread_title:$thread_title,project_id:$project_id,thread_source:$thread_source,route:$route,sub_thread_id:$sub_thread_id,sub_thread_title:$sub_thread_title,parent_thread_id:$parent_thread_id,parent_thread_title:$parent_thread_title,parent_worktree:$parent_worktree,my_open_threads:$open_threads,my_open_threads_more:$open_more} + (if $event_id == "" then {} else {atoll:{event_id:$event_id}} end)')" || return 1
+  mark_stall_attempt || return 1
   if [ "$mode" = openbot ]; then
     post_openbot "$body" || return 1
     echo "$TS $BOT webhook http=$HTTP result=$RESULT mode=openbot" >> "$LOG"
@@ -241,12 +307,11 @@ TS="$(date '+%Y-%m-%dT%H:%M:%S%z')"
 NOW="$(date +%s)"
 route_reset
 NO_STALL_MARK=
-if [ -f "$ROOT/.grokbot" ]; then
-  # Bot name is sanitised so it can only ever point at a file inside $DIR.
-  BOT="$(head -n1 "$ROOT/.grokbot" | tr -cd 'a-z0-9_-')"
+STATUS_FILE="$(status_file "$ROOT")"
+if has_marker "$ROOT"; then
+  BOT="$(marker_bot "$ROOT")"
   ROUTE=marker
   ensure_marker "$ROOT" "$BOT"
-  STATUS_FILE="$ROOT/.grokbot-status"
   # Sentinel preserves trailing newlines for byte-exact dedupe of the payload.
   STATUS="$( { [ -f "$STATUS_FILE" ] && head -c 2000 "$STATUS_FILE" || printf turn_ended_no_status; }; printf '.')"
   STATUS="${STATUS%.}"
@@ -260,7 +325,7 @@ else
     return 0
   fi
   ROUTE=map
-  STATUS="worktree_missing worktree $ROOT no longer has a .grokbot marker (deleted or moved); read the thread for its real state"
+  STATUS="worktree_missing worktree $ROOT no longer has a marker (deleted or moved); read the thread for its real state"
 fi
 
 KEY="$(printf '%s' "$ROOT" | shasum -a 256 | awk '{print $1}')"
@@ -288,7 +353,7 @@ case "$CLOCK" in *[!0-9]*|'') CLOCK="$NOW"; NOCLOCK=1 ;; *) NOCLOCK= ;; esac
 # and inode so rewriting the same line also starts a new stall period.
 REVISION="$(perl -MTime::HiRes=stat -e '
   my @s = stat($ARGV[0]); print @s ? join(":", @s[1,7,9]) : "missing";
-' "$ROOT/.grokbot-status")"
+' "$STATUS_FILE")"
 OBSERVED="$STATE/$KEY.observed"
 if ! "$JQ" -e --arg revision "$REVISION" --arg status "$STATUS"   '.revision == $revision and .status == $status' "$OBSERVED" >/dev/null 2>&1; then
   "$JQ" -n --arg revision "$REVISION" --arg status "$STATUS"     '{revision:$revision,status:$status}' > "$OBSERVED.tmp" &&
@@ -300,17 +365,17 @@ fi
 # `done` or `waiting` thread that died is reported too. With a harness still running the usual
 # rules below apply (approval? ping, waiting reminder, done is skipped).
 TURN_DEAD=
-if [ "$HARNESS" = sweep ] && [ -f "$ROOT/.grokbot" ] && turn_open "$KEY"; then
+if [ "$HARNESS" = sweep ] && has_marker "$ROOT" && turn_open "$KEY"; then
   # Once per dead turn, however the status file changes afterwards.
   [ "$(cat "$STATE/$KEY.turndead" 2>/dev/null)" != "$TURN_START" ] || return 0
   # Quiet since the later of the turn start and the last status write.
-  LIVE="$(perl -e 'my $m = (stat($ARGV[0]))[9] || 0; print $m > $ARGV[1] ? $m : $ARGV[1]' "$ROOT/.grokbot-status" "$((TURN_START / 1000000))")"
+  LIVE="$(perl -e 'my $m = (stat($ARGV[0]))[9] || 0; print $m > $ARGV[1] ? $m : $ARGV[1]' "$STATUS_FILE" "$((TURN_START / 1000000))")"
   AGE=$((NOW - LIVE))
   [ "$AGE" -ge "$((STALL_MINUTES * 60))" ] || return 0
   harness_running "$ROOT"
   case $? in
     1) TURN_DEAD=1
-       [ -f "$ROOT/.grokbot-status" ] || STATUS=no_status
+       [ -f "$STATUS_FILE" ] || STATUS=no_status
        STATUS="stalled $((AGE / 60))m turn_died $STATUS"
        WORD=stalled ;;
     2) return 0 ;;  # pgrep or lsof failed: prefer a missed alert to a false one
@@ -319,7 +384,7 @@ fi
 if [ -n "$TURN_DEAD" ]; then
   : # STATUS is final
 elif [ "$WORD" = waiting ]; then
-  [ ! -f "$STATE/$KEY.waiting" ] || return 0
+  [ ! -f "$STATE/$KEY.waiting" ] || { record_only; return 0; }
   if [ ! -f "$CACHE" ]; then
     "$JQ" -n --argjson clock "$NOW" '{clock:$clock}' > "$CACHE"
   elif [ -n "$NOCLOCK" ]; then
@@ -328,10 +393,11 @@ elif [ "$WORD" = waiting ]; then
   fi
   if [ "$((NOW - CLOCK))" -lt "$STALE" ]; then
     echo "$TS $HARNESS skip=waiting $ROOT" >> "$LOG"
+    record_only
     return 0
   fi
   STATUS="stale $STATUS"
-elif [ "$HARNESS" = sweep ] && [ -f "$ROOT/.grokbot" ]; then
+elif [ "$HARNESS" = sweep ] && has_marker "$ROOT"; then
   [ "$WORD" != "done" ] || return 0
   if [ -f "$STATE/$KEY.stalled" ]; then
     # Already pinged for this status revision. New activity from a running harness ends that
@@ -339,7 +405,7 @@ elif [ "$HARNESS" = sweep ] && [ -f "$ROOT/.grokbot" ]; then
     if harness_running "$ROOT" && recently_active "$ROOT"; then rm -f "$STATE/$KEY.stalled"; fi
     return 0
   fi
-  MODIFIED="$(perl -e 'print((stat($ARGV[0]))[9] || (stat($ARGV[1]))[9] || time)'     "$ROOT/.grokbot-status" "$ROOT/.grokbot")"
+  MODIFIED="$(perl -e 'print((stat($ARGV[0]))[9] || (stat($ARGV[1]))[9] || time)'     "$STATUS_FILE" "$(marker_file "$ROOT")")"
   # No previous ping means the file timestamp alone determines age.
   if [ ! -f "$CACHE" ]; then CLOCK="$MODIFIED"; fi
   [ "$MODIFIED" -le "$CLOCK" ] || CLOCK="$MODIFIED"
@@ -362,6 +428,7 @@ elif [ "$HARNESS" = sweep ] && [ -f "$ROOT/.grokbot" ]; then
 elif [ "$WORD" != needs_input ] && [ "$WORD" != failed ] &&
   "$JQ" -e --arg status "$STATUS" '.status == $status' "$CACHE" >/dev/null 2>&1; then
   echo "$TS $HARNESS skip=duplicate $ROOT" >> "$LOG"
+  record_only
   return 0
 fi
 
@@ -423,8 +490,8 @@ start_turn() {
   SESSION="${3:-}"
   LAST=
   TS="$(date '+%Y-%m-%dT%H:%M:%S%z')"
-  [ -f "$ROOT/.grokbot" ] || return 0
-  BOT="$(head -n1 "$ROOT/.grokbot" | tr -cd 'a-z0-9_-')"
+  has_marker "$ROOT" || return 0
+  BOT="$(marker_bot "$ROOT")"
   [ -n "$BOT" ] || return 0
   ensure_marker "$ROOT" "$BOT"
   STATUS=running
@@ -446,7 +513,7 @@ adopt_pending() {
     [ -f "$f" ] || continue
     { IFS= read -r root; IFS= read -r epoch; IFS= read -r tid; IFS= read -r harness; IFS= read -r session; IFS= read -r transcript; } < "$f" || true
     case "$epoch" in *[!0-9]*|'') rm -f "$f"; continue ;; esac
-    if [ -n "$root" ] && [ -f "$root/.grokbot" ]; then
+    if [ -n "$root" ] && has_marker "$root"; then
       key="$(state_key "$root")"
       end="$(cat "$STATE/$key.turn_ended" 2>/dev/null)"
       case "$end" in *[!0-9]*|'') end=0 ;; esac
@@ -557,6 +624,7 @@ worker() {
   [ -z "$CURRENT" ] || process "$CURRENT" "$HARNESS" "$MESSAGE" "$SESSION_ID" "$TRANSCRIPT_PATH" "$CWD"
   [ ! -f "$MAP" ] || sweep
   sweep_approvals
+  atoll_replay
   # Registry upkeep (look up missing thread ids, re-check old rows, prune). Small batches per hook,
   # bigger ones for the launchd sweep. Skipped when nothing was ever recorded.
   if [ -f "$REG_DB" ] || [ -f "$MAP" ]; then
@@ -635,13 +703,13 @@ approval() {
   route_reset
   NO_STALL_MARK=
   while :; do
-    [ -f "$d/.grokbot" ] && { root="$d"; break; }
+    has_marker "$d" && { root="$d"; break; }
     [ "$d" = "$top" ] || [ "$d" = / ] || [ "$d" = . ] && break
     d="$(dirname "$d")"
   done
   TS="$(date '+%Y-%m-%dT%H:%M:%S%z')"
   if [ -n "$root" ]; then
-    bot="$(head -n1 "$root/.grokbot" | tr -cd 'a-z0-9_-')"
+    bot="$(marker_bot "$root")"
     ROUTE=marker
   else
     # Marker removed with the worktree: fall back to the marker map, as Stop does.
@@ -680,7 +748,8 @@ approval() {
   else
     # Registry: keep the thread row current, using the status file as it is (this ping does not
     # change it). A first event for a worktree may be an approval prompt, so this can create the row.
-    STATUS="$( { [ -f "$ROOT/.grokbot-status" ] && head -c 2000 "$ROOT/.grokbot-status" || printf turn_ended_no_status; }; printf '.')"
+    STATUS_FILE="$(status_file "$ROOT")"
+    STATUS="$( { [ -f "$STATUS_FILE" ] && head -c 2000 "$STATUS_FILE" || printf turn_ended_no_status; }; printf '.')"
     STATUS="${STATUS%.}"
     WORD="$(printf '%s' "$STATUS" | awk 'NR==1 {print $1}')"
     registry_record approval
@@ -699,7 +768,7 @@ hook_turn_start() {
   local key
   mkdir -p "$STATE" 2>/dev/null || return 1
   key="$(state_key "$CURRENT")"
-  if [ -f "$CURRENT/.grokbot" ]; then
+  if has_marker "$CURRENT"; then
     hook_us
     write_epoch "$STATE/$key.turn_started" "$GROKBOT_HOOK_US" || return 1
     [ -z "$TRANSCRIPT_PATH" ] || printf '%s\n' "$TRANSCRIPT_PATH" > "$STATE/$key.transcript"
@@ -718,10 +787,10 @@ hook_turn_start() {
 
 hook_turn_end() {
   local key
-  [ -f "$CURRENT/.grokbot" ] || [ -d "$STATE/pending" ] || return 0
+  has_marker "$CURRENT" || [ -d "$STATE/pending" ] || return 0
   mkdir -p "$STATE" 2>/dev/null || return 0
   key="$(state_key "$CURRENT")"
-  [ ! -f "$CURRENT/.grokbot" ] || { hook_us; write_epoch "$STATE/$key.turn_ended" "$GROKBOT_HOOK_US"; }
+  ! has_marker "$CURRENT" || { hook_us; write_epoch "$STATE/$key.turn_ended" "$GROKBOT_HOOK_US"; }
   rm -f "$STATE/pending/$key"
 }
 

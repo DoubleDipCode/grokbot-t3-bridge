@@ -7,13 +7,14 @@ Append this to every brief a bot sends to T3. Replace `<bot-name>` with the bot'
 **Callback setup (do this first, before anything else):**
 
 ```bash
-echo '<bot-name>' > .grokbot
-echo '.grokbot*' >> "$(git rev-parse --git-common-dir)/info/exclude"
+marker=.atoll; [ -d .atoll ] && marker=.atoll/marker.json
+printf '{"agent":"<bot-name>"}\n' > "$marker"
+printf '%s\n' "$marker" .atoll-status >> "$(git rev-parse --git-common-dir)/info/exclude"
 ```
 
-Run these at the root of this worktree. The second line keeps the marker and status files out of git. Never commit them.
+Run these at the root of this worktree. If you know the issue this work belongs to, add it to the marker: `{"agent":"<bot-name>","issue":"AP-123"}`. The second line keeps the marker and status files out of git. Never commit them.
 
-**Before you end every turn,** overwrite `.grokbot-status` at the worktree root. The first line is exactly one of `done`, `needs_input` or `failed`. After that, add a short note:
+**Before you end every turn,** overwrite `.atoll-status` at the worktree root. The first line is exactly one of `done`, `needs_input` or `failed`. After that, add a short note:
 
 - `done`: the work is finished, the review step has run, and the PR is open. Include the PR URL.
 - `needs_input`: you need a decision. Write the question and the options.
@@ -22,7 +23,7 @@ Run these at the root of this worktree. The second line keeps the marker and sta
 Example:
 
 ```bash
-printf 'needs_input\nShould the export include archived rows? Options: (a) yes, (b) no, (c) behind a flag.\n' > .grokbot-status
+printf 'needs_input\nShould the export include archived rows? Options: (a) yes, (b) no, (c) behind a flag.\n' > .atoll-status
 ```
 
 **If you need a decision, write `needs_input` and end your turn.** Do not wait inside the thread for an answer. The answer will come as a new message in this thread.

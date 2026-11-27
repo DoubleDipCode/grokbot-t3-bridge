@@ -7,11 +7,12 @@ Replace `<bot-name>`, then append this to the task given to `claude` or `codex`.
 First, at the worktree root:
 
 ```bash
-printf '%s\n' '<bot-name>' > .grokbot
-printf '%s\n' '.grokbot*' >> "$(git rev-parse --git-common-dir)/info/exclude"
+marker=.atoll; [ -d .atoll ] && marker=.atoll/marker.json
+printf '{"agent":"<bot-name>"}\n' > "$marker"
+printf '%s\n' "$marker" .atoll-status >> "$(git rev-parse --git-common-dir)/info/exclude"
 ```
 
-Before ending each turn, overwrite `.grokbot-status` with one line:
+Before ending each turn, overwrite `.atoll-status` with one line:
 
 - `done <result or PR URL>` when the requested work and review are complete.
 - `needs_input <question and options>` when a decision is required.
