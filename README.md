@@ -182,7 +182,7 @@ Two optional lines in `~/.grokbot-hooks/<bot>.env` stop pings that only add nois
 | Line | What it stops | What still arrives | Use it when |
 | --- | --- | --- | --- |
 | `GROKBOT_INSTANT_APPROVAL=0` | The instant `codex-permission` pings. | `claude-notify` pings, and the [pending-approvals sweep](#delegated-sub-threads-and-t3s-own-list-of-pending-approvals) for requests that really wait in T3. [Limits](docs/hooks.md#turning-off-the-instant-codex-pings-for-one-bot). | The bot's T3 threads run in Auto mode, where this hook also fires for requests that T3 approves itself. |
-| `GROKBOT_SKIP_WORKTREE_MISSING=1` | Every [`worktree_missing`](#actionable-status-and-stall-checks) ping, from sweeps and from turn ends. | Pings for worktrees that still have their marker. [Limits](docs/hooks.md#turning-off-worktree_missing-pings-for-one-bot). | A cleanup removes many worktrees, and each one would wake the bot. |
+| `GROKBOT_SKIP_WORKTREE_MISSING=1` | Every [`worktree_missing`](#actionable-status-and-stall-checks) ping, from sweeps and from turn ends. Without it, the sweep already stays quiet for [removals on purpose](docs/hooks.md#removed-worktrees-only-open-work-is-reported). | Pings for worktrees that still have their marker. [Limits](docs/hooks.md#turning-off-worktree_missing-pings-for-one-bot). | A cleanup removes many worktrees, and each one would wake the bot. |
 
 ## Approval-prompt pings
 
@@ -298,6 +298,7 @@ Run `bash tests/sync-global-rules-test.sh` for the global rules sync and its ins
 Run `bash tests/install-test.sh` for the installer and uninstaller against a temporary HOME.
 Run `bash tests/stall-test.sh` for stall watchdog cases.
 Run `bash tests/turn-start-test.sh` for the turn-start hook and dead-turn cases.
+Run `bash tests/worktree-missing-test.sh` for removed worktrees (merged branch, pull request and thread states).
 Run `bash tests/route-test.sh` for sub-thread routing and the pending-approvals sweep.
 Run `bash tests/notify-test.sh` (and `tests/registry-test.sh`, `tests/route-test.sh`, `tests/stall-test.sh`, `tests/turn-start-test.sh`, `tests/install-test.sh`, `python3 tests/notify-http-test.py`) for isolated tests with a stub curl. The tests
 use temporary HOME, hooks, and state directories and make no real HTTP requests.
@@ -332,7 +333,7 @@ Precedence: a real (non-empty) environment variable, then the config file, then 
 
 **The agent writes its status to a file.** Before ending each turn the agent overwrites `.grokbot-status` with a status word and a short note. The script reads that file. It does not parse harness transcripts, which differ between harnesses and change between versions.
 
-**It survives a removed or switched worktree.** Every run that finds a marker records the worktree and bot in `~/.grokbot-hooks/markers.tsv`. If a later turn ends in a known worktree whose marker is gone, the bot is still notified, with the status `worktree_missing`. Runs with no marker and no record are always logged as `no-marker <path>`, so a missed callback shows up in the log instead of failing silently.
+**It survives a removed or switched worktree.** Every run that finds a marker records the worktree and bot in `~/.grokbot-hooks/markers.tsv`. If a later turn ends in a known worktree whose marker is gone, the bot is still notified, with the status `worktree_missing`. When the sweep finds the directory gone, it stays quiet if the removal was on purpose (thread settled or archived, branch merged, or pull request merged or closed; needs `gh` for the last one) and reports it otherwise: see [removed worktrees](docs/hooks.md#removed-worktrees-only-open-work-is-reported). Runs with no marker and no record are always logged as `no-marker <path>`, so a missed callback shows up in the log instead of failing silently.
 
 **The hook fires whether or not the agent remembers.** The hook is run by the harness, not by the agent. If the agent forgets to write a status, the payload says `turn_ended_no_status` and the bot reads the thread to find out what happened. You still get woken up.
 
