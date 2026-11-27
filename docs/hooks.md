@@ -202,15 +202,15 @@ It never prints to stdout and always exits 0, so it cannot block or change the a
 When the sweep finds that a known worktree's directory is gone, it first checks whether the removal was on purpose. It drops the entry without a ping when any one of these is true:
 
 1. **The thread is closed.** `t3 thread show` reports it settled or archived, or says it no longer exists. When `t3` cannot answer, the flags the registry stored at its last check are used.
-2. **The branch is merged** into `main`, `master` or origin's default branch, as far as the local refs know (nothing is fetched). A branch tip on main's own first-parent line does not count, because a new branch with no commits looks like that. So a fast-forward merge is left to the next check.
-3. **Its pull request is merged or closed** (`gh pr list --head <branch> --state all`), no pull request for the branch is open, and the pull request contains the last commit the hook knows. A reused branch name with newer commits, or a fork's branch of the same name, does not count.
+2. **The branch is merged** into `main`, `master` or origin's default branch, as far as the local refs know (nothing is fetched). A branch tip on main's own first-parent line does not count, because a new branch with no commits looks like that. So a fast-forward merge is left to the next check. The last commit the hook saw must be covered too, so a branch reset away from it does not count.
+3. **Its pull request is merged or closed** (`gh pr list --head <branch> --state all`), no pull request for the branch is open, and the pull request contains the branch tip and the last commit the hook saw. A reused branch name with newer commits, or a fork's branch of the same name, does not count.
 
 Otherwise the usual `worktree_missing` ping goes out once: the work is gone while its thread or pull request is still open, or nothing says it is finished. The same happens when `gh` is missing, fails or does not answer within 10 seconds.
 
 - A drop removes the `markers.tsv` line, marks the registry row `removed` (so it leaves `my_open_threads`), records nothing in Atoll and logs `<bot> worktree_missing dropped (<reason>) <worktree>` once.
 - Checks 2 and 3 need the repository and branch, which cannot be read from a removed directory. Every sighting of a marked worktree stores them in `<key>.git` in the state directory. A worktree that was removed before any sighting by this version, a main checkout that is itself removed, a detached HEAD and the default branch get only check 1.
 - Only the sweep, and only when the directory is gone. A turn that ends in such a worktree is still reported (it carries the last message), and so is a worktree that merely lost its marker.
-- One sweep makes at most 5 `gh` checks; the rest wait, unreported, for the next sweep. After a `gh` timeout the same run asks no more and pings as usual.
+- One sweep checks at most 5 removed worktrees and starts no new check after 30 seconds, because it holds the shared lock; the rest wait, unreported, for the next sweep. After a `gh` timeout the same run asks no more and pings as usual.
 - A merged branch or pull request does not drop an entry while a turn is still running there (for at most a day).
 - A `worktree_missing` ping that was already sent is not checked again.
 

@@ -214,6 +214,45 @@ sweep
 expect_sends 0 'old turn'
 dropped running 'PR for running'
 
+# --- 8b. A branch reset away from the last seen commit does not hide that work. ---
+new_wt rewound commit
+reset
+remove_wt rewound
+git -C "$M" branch -f rewound "$(git -C "$M" rev-parse 'main^2')"   # an older, merged side commit
+pr rewound MERGED
+sweep
+expect_sends 1 'reset branch'
+pinged rewound
+
+# --- 8c. Entries waiting for a running turn are not asked about again and do not block later ones. ---
+for i in 1 2 3 4 5; do
+  new_wt "wait$i" commit; pr "wait$i" MERGED
+  key="$(printf '%s' "$TMP/wt-wait$i" | shasum -a 256 | awk '{print $1}')"
+  printf '%s000000\n' "$(($(date +%s) + 5))" > "$GROKBOT_STATE_DIR/$key.turn_started"
+done
+new_wt behind commit; pr behind OPEN
+reset
+for i in 1 2 3 4 5; do remove_wt "wait$i"; done
+remove_wt behind
+sweep
+expect_sends 0 'five waiting'
+sweep; sweep
+expect_sends 1 'entry behind the waiting ones'
+pinged behind
+[ "$(grep -c '^wait' "$FAKE/gh-calls")" = 5 ] || fail "waiting entries asked again: $(grep -c '^wait' "$FAKE/gh-calls")"
+
+# --- 8d. Thread checks share the per-run limit. ---
+for i in 1 2 3 4 5 6 7; do
+  thread "t-many$i" "many$i" false false; new_wt "many$i" commit "t-many$i"; thread "t-many$i" "many$i" false true
+done
+reset
+for i in 1 2 3 4 5 6 7; do remove_wt "many$i"; done
+sweep
+[ "$(grep -c "worktree_missing dropped (thread settled.*wt-many" "$LOGF")" = 5 ] || fail "thread checks in one run: $(grep -c 'dropped.*wt-many' "$LOGF")"
+sweep
+expect_sends 0 'settled backlog'
+for i in 1 2 3 4 5 6 7; do dropped "many$i" 'thread settled'; done
+
 # --- 9. A big cleanup: at most 5 gh calls per run, nothing pinged while it waits. ---
 for i in 1 2 3 4 5 6 7; do new_wt "bulk$i" commit; pr "bulk$i" MERGED; done
 reset

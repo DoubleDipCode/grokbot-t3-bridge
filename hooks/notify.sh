@@ -278,6 +278,7 @@ ensure_marker() {
 # --- Missing worktrees: was the removal intentional? ------------------------------------------------
 # Once a worktree is gone its branch and repository cannot be asked, so every sighting of a marked
 # worktree stores them: $STATE/<key>.git holds the git common dir, HEAD and branch, one per line.
+WM_CHECKS=0; WM_DEADLINE=; WM_GH_HUNG=   # per run: limits on what one sweep spends on removed worktrees
 remember_git() {
   local out common sha branch key
   out="$(git -C "$1" rev-parse --git-common-dir HEAD --abbrev-ref HEAD 2>/dev/null)" || return 0
@@ -287,7 +288,7 @@ remember_git() {
   [ -n "$common" ] && mkdir -p "$STATE" 2>/dev/null || return 0
   key="$(state_key "$1")"
   printf '%s\n%s\n%s\n' "$common" "$sha" "$branch" > "$STATE/$key.git.$$" && mv -f "$STATE/$key.git.$$" "$STATE/$key.git"
-  rm -f "$STATE/$key.wm-checked"
+  rm -f "$STATE/$key.wm-checked" "$STATE/$key.wm-deferred"
 }
 
 # run_limited <seconds> <command...>: kills the command after the limit (exit 142). The command runs
@@ -299,22 +300,30 @@ run_limited() {
     alarm $s; waitpid $p, 0; exit($? ? ($? >> 8 || 1) : 0)' "$@"
 }
 
-# branch_merged <git common dir> <tip> : the tip is in main (or master, or origin's default branch)
+# branch_merged <git common dir> <tip> <default branch> <last seen commit>: the tip is in main (or master, or origin's default branch)
 # and came in from the side. A tip on main's own first-parent line is not counted: a new branch with
-# no commits of its own looks exactly like that.
+# no commits of its own looks exactly like that. The commit the hook last saw must be covered too: a
+# branch reset or rebased away from it says nothing about that work.
 branch_merged() {
   local ref
   for ref in "refs/remotes/origin/$3" refs/remotes/origin/main refs/remotes/origin/master \
              "refs/heads/$3" refs/heads/main refs/heads/master; do
     git --git-dir="$1" rev-parse -q --verify "$ref" >/dev/null 2>&1 || continue
     git --git-dir="$1" merge-base --is-ancestor "$2" "$ref" 2>/dev/null || continue
+    [ -z "$4" ] || git --git-dir="$1" merge-base --is-ancestor "$4" "$2" 2>/dev/null ||
+      git --git-dir="$1" merge-base --is-ancestor "$4" "$ref" 2>/dev/null || continue
     git --git-dir="$1" rev-list --first-parent "$ref" 2>/dev/null | grep -qx "$2" || return 0
   done
   return 1
 }
 
-# pr_finished <git common dir> <branch> <tip>: 0 when gh shows a merged or closed PR that contains
-# the tip and no open PR for the branch; 1 when not; also 1 when gh is missing, fails or hangs.
+# pr_contains <git common dir> <PR head> <commit>
+pr_contains() {
+  [ -z "$3" ] || [ "$2" = "$3" ] || git --git-dir="$1" merge-base --is-ancestor "$3" "$2" 2>/dev/null
+}
+
+# pr_finished <git common dir> <branch> <tip> <last seen commit>: 0 when gh shows a merged or closed PR
+# that contains both commits and no open PR for the branch; 1 when not; also 1 when gh is missing, fails or hangs.
 pr_finished() {
   local dir="$1" out rc oids oid
   command -v gh >/dev/null 2>&1 || return 1
@@ -333,8 +342,7 @@ pr_finished() {
     | if any(.[]; .state == "OPEN") then empty else .[] | select(.state == "MERGED" or .state == "CLOSED") | .headRefOid end' 2>/dev/null)"
   # An old PR under a reused branch name does not cover newer commits.
   for oid in $oids; do
-    [ "$oid" != "$3" ] || return 0
-    git --git-dir="$1" merge-base --is-ancestor "$3" "$oid" 2>/dev/null && return 0
+    pr_contains "$1" "$oid" "$3" && pr_contains "$1" "$oid" "$4" && return 0
   done
   return 1
 }
@@ -345,8 +353,13 @@ drop_worktree() {
   tmp="$(mktemp "$DIR/markers.XXXXXX" 2>/dev/null)" || return 1
   awk -F'\t' -v r="$ROOT" '$1!=r' "$MAP" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$MAP" || { rm -f "$tmp"; return 1; }
   ! type reg_mark_removed >/dev/null 2>&1 || ! registry_init || reg_mark_removed "$ROOT"
-  rm -f "$STATE/$KEY".{json,observed,stalled,waiting,git,wm-checked,turn_started,turn_ended,turndead,transcript}
+  rm -f "$STATE/$KEY".{json,observed,stalled,waiting,git,wm-checked,wm-deferred,turn_started,turn_ended,turndead,transcript}
   echo "$TS $BOT worktree_missing dropped ($1) $ROOT" >> "$LOG"
+}
+
+# A turn that started less than a day ago and has not ended.
+turn_running() {
+  turn_open "$1" && [ "$(($(date +%s) - TURN_START / 1000000))" -lt 86400 ]
 }
 
 # settle_missing: the sweep found that the directory ROOT is gone. Returns 0 when nothing must be
@@ -360,6 +373,14 @@ settle_missing() {
   ! "$JQ" -e --arg status "$STATUS" '.status == $status' "$STATE/$KEY.json" >/dev/null 2>&1 || return 1
   # Checked within the hour and still here (the ping could not be sent): do not ask again.
   [ -z "$(find "$STATE/$KEY.wm-checked" -mmin -60 -print 2>/dev/null)" ] || return 1
+  # Finished, but a turn was still running there: wait for it without asking again.
+  [ ! -f "$STATE/$KEY.wm-deferred" ] || ! turn_running "$KEY" || return 0
+  rm -f "$STATE/$KEY.wm-deferred"
+  # The sweep holds the shared lock: at most 5 entries per run and none started after 30 seconds. The
+  # rest stay quiet until a later sweep.
+  [ -n "$WM_DEADLINE" ] || WM_DEADLINE=$(($(date +%s) + 30))
+  [ "$WM_CHECKS" -lt 5 ] && [ "$(date +%s)" -lt "$WM_DEADLINE" ] || return 0
+  WM_CHECKS=$((WM_CHECKS + 1))
   if type registry_thread_closed >/dev/null 2>&1 && registry_thread_closed "$ROOT" </dev/null; then
     drop_worktree 'thread settled, archived or deleted'; return
   fi
@@ -372,17 +393,14 @@ settle_missing() {
       *)
         tip="$(git --git-dir="$common" rev-parse -q --verify "refs/heads/$branch^{commit}" 2>/dev/null)" || tip="$sha"
         local reason=
-        if branch_merged "$common" "$tip" "${def:-main}"; then
+        if branch_merged "$common" "$tip" "${def:-main}" "$sha"; then
           reason="branch $branch merged"
         else
-          # At most 5 gh calls per run; the rest wait for the next sweep.
-          [ "${WM_GH_CALLS:-0}" -lt 5 ] || return 0
-          WM_GH_CALLS=$((${WM_GH_CALLS:-0} + 1))
-          ! pr_finished "$common" "$branch" "$tip" || reason="PR for $branch merged or closed"
+          ! pr_finished "$common" "$branch" "$tip" "$sha" || reason="PR for $branch merged or closed"
         fi
         if [ -n "$reason" ]; then
           # A turn that is still running reports its own end; decide after it, or after a day.
-          ! turn_open "$KEY" || [ "$(($(date +%s) - TURN_START / 1000000))" -ge 86400 ] || return 0
+          if turn_running "$KEY"; then touch "$STATE/$KEY.wm-deferred"; return 0; fi
           drop_worktree "$reason"; return
         fi ;;
     esac
