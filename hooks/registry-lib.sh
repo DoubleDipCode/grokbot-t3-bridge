@@ -210,7 +210,7 @@ registry_record() {
       set="$set, updated_at=CASE WHEN $keep THEN updated_at WHEN status_word IS NOT $q_word OR status_note IS NOT $q_note THEN $q_ts ELSE updated_at END" ;;
   esac
   case "$mode" in
-    start|turn) set="$set, turn_event_us=$ev"; guard=" AND COALESCE(turn_event_us,0) <= $ev" ;;
+    start|turn) set="$set, removed=0, turn_event_us=$ev"; guard=" AND COALESCE(turn_event_us,0) <= $ev" ;;
   esac
   upd="UPDATE threads SET $set WHERE worktree=$q_root$guard;"
   ins="INSERT OR IGNORE INTO threads(worktree,bot,branch,harness,session_id,status_word,status_note,last_message,first_seen,updated_at,started_at,turn_event_us) VALUES($q_root,$q_bot,$q_branch,$q_harness,$q_session,$q_word,$q_note,$q_last,$q_ts,$q_ts,$started,$([ "$mode" = start ] || [ "$mode" = turn ] && echo "$ev" || echo NULL));"
@@ -333,6 +333,35 @@ UPDATE threads SET state=$REG_STATE_SQL WHERE worktree=$REG_Q;
 UPDATE threads SET final_since=COALESCE(final_since,$(date +%s)) WHERE worktree=$REG_Q AND state='removed';
 COMMIT;
 SQL
+}
+
+# registry_thread_closed <root>: 0 when the thread behind this row is settled, archived or deleted.
+# `t3 thread show` decides; when it cannot answer, the flags stored at the last check do.
+registry_thread_closed() {
+  local row id flag cli out rc closed errf
+  reg_on && [ -f "$REG_DB" ] || return 1
+  reg_q "$1"
+  row="$(reg_run <<< "SELECT COALESCE(thread_id,''), (archived OR settled OR removed) FROM threads WHERE worktree=$REG_Q;")" || return 1
+  IFS="$REG_US" read -r id flag <<< "$row"
+  [ -n "$id" ] || return 1
+  cli="${GROKBOT_T3_CLI:-${T3CODE_CLI_PATH:-$HOME/.t3/bin/t3}}"
+  if [ -x "$cli" ] && { [ ! -f "$STATE/t3cli.fail" ] || [ -n "$(find "$STATE/t3cli.fail" -mmin "+$((REG_BREAKER_SECONDS / 60))" -print 2>/dev/null)" ]; } &&
+     mkdir -p "$STATE" 2>/dev/null; then
+    errf="$STATE/t3err.$$"
+    out="$(reg_timeout 8 "$cli" thread show "$id" --json --messages 0 2>"$errf" </dev/null)"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      rm -f "$errf"
+      closed="$(printf '%s' "$out" | "$JQ" -r '.thread | if .threadId then ((.archived // false) or (.settled // false)) else empty end' 2>/dev/null)"
+      case "$closed" in true) return 0 ;; false) return 1 ;; esac
+    elif grep -q 'no longer available' "$errf" 2>/dev/null; then
+      rm -f "$errf"; return 0
+    else
+      rm -f "$errf"; touch "$STATE/t3cli.fail" 2>/dev/null
+      echo "$TS registry-error t3-cli rc=$rc" >> "$LOG"
+    fi
+  fi
+  [ "$flag" = 1 ]
 }
 
 # reg_clear_thread <root> <id>: T3 says <id> lives in another worktree, so this row must not name it.

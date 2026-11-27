@@ -175,6 +175,15 @@ Each callback names the T3 thread it belongs to. The hook finds it from the `T3C
 
 So the routine can go straight to `t3_thread_read` with `thread_id` and answer "which of my threads are open" from the payload, with no `t3_thread_list` or `t3_thread_search`. Nobody writes registry entries by hand. Old payload fields are unchanged. Details, fallbacks and risks (the Codex lookup reads T3's internal storage): [docs/hooks.md](docs/hooks.md#thread-registry).
 
+## Per-bot options
+
+Two optional lines in `~/.grokbot-hooks/<bot>.env` stop pings that only add noise. Both are off by default. Each line must be exactly as shown (no `export`, quotes, spaces or trailing comment). `set-webhook.sh` rewrites the file, so add the lines again after you run it.
+
+| Line | What it stops | What still arrives | Use it when |
+| --- | --- | --- | --- |
+| `GROKBOT_INSTANT_APPROVAL=0` | The instant `codex-permission` pings. | `claude-notify` pings, and the [pending-approvals sweep](#delegated-sub-threads-and-t3s-own-list-of-pending-approvals) for requests that really wait in T3. [Limits](docs/hooks.md#turning-off-the-instant-codex-pings-for-one-bot). | The bot's T3 threads run in Auto mode, where this hook also fires for requests that T3 approves itself. |
+| `GROKBOT_SKIP_WORKTREE_MISSING=1` | Every [`worktree_missing`](#actionable-status-and-stall-checks) ping, from sweeps and from turn ends. Without it, the sweep already stays quiet for [removals on purpose](docs/hooks.md#removed-worktrees-only-open-work-is-reported). | Pings for worktrees that still have their marker. [Limits](docs/hooks.md#turning-off-worktree_missing-pings-for-one-bot). | A cleanup removes many worktrees, and each one would wake the bot. |
+
 ## Approval-prompt pings
 
 A thread blocked on a permission prompt has not ended its turn, so Stop never fires. Two more hooks ping the bot while the prompt is open, with status `needs_input approval <summary>`:
@@ -183,6 +192,8 @@ A thread blocked on a permission prompt has not ended its turn, so Stop never fi
 - **Codex:** the `PermissionRequest` event (`notify.sh codex-permission`). Trust it once in `codex` under `/hooks`, like the Stop hook. Codex's `notify` setting cannot do this: it only supports `agent-turn-complete`.
 
 `install.sh` registers them: `Notification` in every Claude config dir it finds (see [Configuration](#configuration)) and `PermissionRequest` in `~/.codex/hooks.json`. It also registers the `UserPromptSubmit` turn-start hooks for [dead turns](#dead-turns); like every Codex hook, the Codex one must be trusted in `/hooks`. These pings always send (no dedupe) and never touch `.grokbot-status`. A bot cannot answer the prompt; it should tell the human.
+
+A bot can turn off the instant Codex pings: see [Per-bot options](#per-bot-options).
 
 As a fallback, the sweep sends `stalled <N>m approval? <status>` when a harness is running in a marked worktree but nothing has changed for `GROKBOT_STALL_MINUTES` (default 45). Details: [docs/hooks.md](docs/hooks.md#approval-prompt-pings).
 
@@ -287,6 +298,7 @@ Run `bash tests/sync-global-rules-test.sh` for the global rules sync and its ins
 Run `bash tests/install-test.sh` for the installer and uninstaller against a temporary HOME.
 Run `bash tests/stall-test.sh` for stall watchdog cases.
 Run `bash tests/turn-start-test.sh` for the turn-start hook and dead-turn cases.
+Run `bash tests/worktree-missing-test.sh` for removed worktrees (merged branch, pull request and thread states).
 Run `bash tests/route-test.sh` for sub-thread routing and the pending-approvals sweep.
 Run `bash tests/notify-test.sh` (and `tests/registry-test.sh`, `tests/route-test.sh`, `tests/stall-test.sh`, `tests/turn-start-test.sh`, `tests/install-test.sh`, `python3 tests/notify-http-test.py`) for isolated tests with a stub curl. The tests
 use temporary HOME, hooks, and state directories and make no real HTTP requests.
@@ -321,7 +333,7 @@ Precedence: a real (non-empty) environment variable, then the config file, then 
 
 **The agent writes its status to a file.** Before ending each turn the agent overwrites `.grokbot-status` with a status word and a short note. The script reads that file. It does not parse harness transcripts, which differ between harnesses and change between versions.
 
-**It survives a removed or switched worktree.** Every run that finds a marker records the worktree and bot in `~/.grokbot-hooks/markers.tsv`. If a later turn ends in a known worktree whose marker is gone, the bot is still notified, with the status `worktree_missing`. Runs with no marker and no record are always logged as `no-marker <path>`, so a missed callback shows up in the log instead of failing silently.
+**It survives a removed or switched worktree.** Every run that finds a marker records the worktree and bot in `~/.grokbot-hooks/markers.tsv`. If a later turn ends in a known worktree whose marker is gone, the bot is still notified, with the status `worktree_missing`. When the sweep finds the directory gone, it stays quiet if the removal was on purpose (thread settled or archived, branch merged, or pull request merged or closed; needs `gh` for the last one) and reports it otherwise: see [removed worktrees](docs/hooks.md#removed-worktrees-only-open-work-is-reported). Runs with no marker and no record are always logged as `no-marker <path>`, so a missed callback shows up in the log instead of failing silently.
 
 **The hook fires whether or not the agent remembers.** The hook is run by the harness, not by the agent. If the agent forgets to write a status, the payload says `turn_ended_no_status` and the bot reads the thread to find out what happened. You still get woken up.
 

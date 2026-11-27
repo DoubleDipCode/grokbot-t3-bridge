@@ -121,6 +121,20 @@ Claude `notification_type` values that count as approval or input: `permission_p
 
 **Codex `notify`:** Codex's `notify` setting supports only `agent-turn-complete`; `approval-requested` exists only for its built-in TUI notifications. Use the `PermissionRequest` hook instead. It may also fire for requests that Codex's auto-review then approves, so an occasional ping needs no action.
 
+### Turning off the instant Codex pings for one bot
+
+In T3 Auto mode the Codex `PermissionRequest` hook can fire many times in one run for requests that T3 then approves itself. To stop those pings for one bot, add this line to `~/.grokbot-hooks/<bot>.env`:
+
+```text
+GROKBOT_INSTANT_APPROVAL=0
+```
+
+- The line must be exactly that: no `export`, quotes, spaces or trailing comment. Without it (or with any other value) every ping is sent, as before.
+- It drops only `codex-permission` pings, including those for sub-threads routed to this bot. `notify.log` shows `<bot> codex-permission skipped (instant approvals off)`. A skipped ping also does not update the thread registry and is not recorded in Atoll. `claude-notify` pings are still sent.
+- Requests that are really waiting in T3 are still reported by the [pending-approvals sweep](#the-pending-approvals-sweep), after `GROKBOT_APPROVAL_MINUTES` (default 10). The sweep runs with other hook runs or from the optional launchd job, so install that job if nothing else may be running.
+- Do not use it where the sweep cannot see the prompt: Codex outside T3, `GROKBOT_APPROVAL_MINUTES=0`, `GROKBOT_REGISTRY=0` or `GROKBOT_T3_DB_LOOKUP=0`.
+- `set-webhook.sh` rewrites the env file, so add the line again after you run it.
+
 Checked on 2026-11-04 against the [Claude hooks reference](https://code.claude.com/docs/en/hooks) and the [Codex hooks reference](https://developers.openai.com/codex/hooks); the installed codex-cli 0.166.0 binary knows the `PermissionRequest` event.
 
 ### Stall fallback in the sweep
@@ -175,13 +189,44 @@ This is the safety net for prompts that no hook reported: a harness whose config
    - Records `worktree<TAB>bot` in `~/.grokbot-hooks/markers.tsv` (mode 600, one line per worktree, at most 500 lines, rewritten only when something changed).
    - Reads up to 2000 bytes of `.grokbot-status`, or uses `turn_ended_no_status` if the file is missing.
 4. If there is no `.grokbot` file:
-   - If `markers.tsv` has an entry for this exact path, the worktree was removed or the session is running in an old path. It uses that bot and the status `worktree_missing <path> ...`.
+   - If `markers.tsv` has an entry for this exact path, the worktree was removed or the session is running in an old path. It uses that bot and the status `worktree_missing <path> ...`. A sweep first checks [whether the removal was on purpose](#removed-worktrees-only-open-work-is-reported).
    - Otherwise it logs `no-marker <path>` and exits. Nothing is sent.
 5. Writes one line to `~/.grokbot-hooks/notify.log`.
 6. Loads `~/.grokbot-hooks/<bot>.env`. If it is missing, stops here.
 7. POSTs the payload in the background with a 10-second timeout, and logs the HTTP status code.
 
 It never prints to stdout and always exits 0, so it cannot block or change the agent's turn. It also rotates `notify.log` once it passes about 1 MB.
+
+### Removed worktrees: only open work is reported
+
+When the sweep finds that a known worktree's directory is gone, it first checks whether the removal was on purpose. It drops the entry without a ping when any one of these is true:
+
+1. **The thread is closed.** `t3 thread show` reports it settled or archived, or says it no longer exists. When `t3` cannot answer, the flags the registry stored at its last check are used.
+2. **The branch is merged** into `main`, `master` or origin's default branch, as far as the local refs know (nothing is fetched). A branch tip on main's own first-parent line does not count, because a new branch with no commits looks like that. So a fast-forward merge is left to the next check. The last commit the hook saw must be covered too, so a branch reset away from it does not count.
+3. **Its pull request is merged or closed** (`gh pr list --head <branch> --state all`), no pull request for the branch is open, and the pull request contains the branch tip and the last commit the hook saw. A reused branch name with newer commits, or a fork's branch of the same name, does not count.
+
+Otherwise the usual `worktree_missing` ping goes out once: the work is gone while its thread or pull request is still open, or nothing says it is finished. The same happens when `gh` is missing, fails or does not answer within 10 seconds.
+
+- A drop removes the `markers.tsv` line, marks the registry row `removed` (so it leaves `my_open_threads`), records nothing in Atoll and logs `<bot> worktree_missing dropped (<reason>) <worktree>` once.
+- Checks 2 and 3 need the repository and branch, which cannot be read from a removed directory. Every sighting of a marked worktree stores them in `<key>.git` in the state directory. A worktree that was removed before any sighting by this version, a main checkout that is itself removed, a detached HEAD and the default branch get only check 1.
+- Only the sweep, and only when the directory is gone. A turn that ends in such a worktree is still reported (it carries the last message), and so is a worktree that merely lost its marker.
+- One sweep checks at most 5 removed worktrees and starts no new check after 30 seconds, because it holds the shared lock; the rest wait, unreported, for the next sweep. After a `gh` timeout the same run asks no more and pings as usual.
+- A merged branch or pull request does not drop an entry while a turn is still running there (for at most a day).
+- A `worktree_missing` ping that was already sent is not checked again.
+
+### Turning off `worktree_missing` pings for one bot
+
+A cleanup that removes many worktrees wakes the bot once per worktree. To stop these pings for one bot, add this line to `~/.grokbot-hooks/<bot>.env`:
+
+```text
+GROKBOT_SKIP_WORKTREE_MISSING=1
+```
+
+- The line must be exactly that. Without it every `worktree_missing` ping is sent, as before.
+- It applies to sweeps and to turn ends. A thread that removes its own marker or worktree before its turn ends then sends nothing at all, also not its final result. Do not use it for a bot that depends on that fallback.
+- Nothing else happens for such an event: no Atoll record, and the thread registry is not updated, so `my_open_threads` can keep showing the last status.
+- `notify.log` shows `<bot> worktree_missing skipped <worktree>` once per worktree; a `.wm-skipped` file in the state directory remembers it.
+- `set-webhook.sh` rewrites the env file, so add the line again after you run it.
 
 ### Why the marker map exists
 
@@ -274,7 +319,7 @@ Settings (environment or `~/.grokbot-hooks/config`): `GROKBOT_REGISTRY=0` turns 
 | `stalled <N>m turn_died <status>` | Sweep only: a turn started (turn-start hook) and never ended, no harness is running, and nothing changed for N minutes (default 45). Sent even if the old status was `done` or `waiting`. Once per dead turn. `<status>` is the worktree's last status text, `no_status` if there is none. Treat like `failed`. See [Turn-start hook](#turn-start-hook). |
 | `stalled <N>m approval_pending <kind>` | Sweep only (`harness: "sweep"`): T3's own list shows a request of that `kind` (`command`, `user_input`, ...) waiting for a human for N minutes. Once per request. See [pending approvals](#routing-for-marker-less-threads-and-the-pending-approvals-sweep). |
 | `stalled <N>m approval? <status>` | Sweep only (`harness: "sweep"`): a harness is running but nothing has changed for N minutes; it may be blocked on an approval prompt. `<status>` is the worktree's last status text. |
-| `worktree_missing` | The worktree is known from `markers.tsv` but has no marker now (removed, or the session's cwd is an old path). The full text is `worktree_missing worktree <path> no longer has a .grokbot marker (deleted or moved); read the thread for its real state`. `branch` is usually empty. Read the thread. |
+| `worktree_missing` | The worktree is known from `markers.tsv` but has no marker now (removed, or the session's cwd is an old path). The full text is `worktree_missing worktree <path> no longer has a .grokbot marker (deleted or moved); read the thread for its real state`. `branch` is usually empty. The sweep does not send it for [removals on purpose](#removed-worktrees-only-open-work-is-reported). Read the thread. |
 
 Request headers in Grok Bot mode: `Content-Type: application/json` and, if set, `Authorization: <value from set-webhook.sh>`.
 
@@ -298,6 +343,10 @@ What the log lines mean:
 | `... status=worktree_missing worktree /path ...` | Known worktree, marker gone. The bot was notified and should read the thread. |
 | `... codex bot=codexbot branch=... status=done` | Hook ran in a bot worktree. |
 | `... codexbot webhook http=200` | Callback delivered. |
+| `... codexbot worktree_missing dropped (reason) /path` | The worktree was removed on purpose; nothing was sent and the entry is gone. |
+| `... codexbot worktree_missing gh-failed rc=N /path` | `gh` could not answer (`rc=142`: timed out), so the usual ping follows. |
+| `... codexbot worktree_missing skipped /path` | The env file has `GROKBOT_SKIP_WORKTREE_MISSING=1`, so this ping was [not sent](#turning-off-worktree_missing-pings-for-one-bot). Logged once per worktree. |
+| `... codexbot codex-permission skipped (instant approvals off)` | The env file has `GROKBOT_INSTANT_APPROVAL=0`, so this instant ping was [not sent](#turning-off-the-instant-codex-pings-for-one-bot). |
 | `... codexbot webhook http=401` | Wrong or missing Authorization value. Run `set-webhook.sh` again. In OpenBot mode (`mode=openbot` at the end of the line): wrong signing secret, or the Mac's clock is more than 5 minutes off. |
 | `... codexbot webhook http=202 result=0 mode=openbot` | OpenBot accepted the callback (`http=200` there: it had that delivery id already). |
 | `... codexbot webhook openbot-retry-503` | OpenBot said 503 (host offline or busy); the hook tried once more after a second. The next `webhook http=` line is the retry's result. |

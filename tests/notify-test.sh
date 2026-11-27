@@ -69,7 +69,17 @@ jq -e 'select(.status == "stale waiting on CI")' "$CALLS" >/dev/null
 export GROKBOT_STALE_SECONDS=7200
 run sweep; count 11
 rm "$TMP/work/.grokbot"
+# GROKBOT_SKIP_WORKTREE_MISSING=1: no ping from sweeps or turn ends, one log line per worktree.
+cp "$GROKBOT_HOOKS_DIR/test.env" "$TMP/test.env.orig"
+printf 'GROKBOT_SKIP_WORKTREE_MISSING=1\n' >> "$GROKBOT_HOOKS_DIR/test.env"
+run sweep; run sweep; run 'done after cleanup'; count 11
+[ "$(grep -c 'test worktree_missing skipped ' "$GROKBOT_HOOKS_DIR/notify.log")" = 1 ] || { echo 'FAIL: worktree_missing skip not logged exactly once'; exit 1; }
+[ "$(find "$GROKBOT_STATE_DIR" -name '*.wm-skipped' | wc -l | tr -d ' ')" = 1 ] || { echo 'FAIL: wm-skipped state file'; exit 1; }
+# Any other value, or no line (the default), sends as before.
+cp "$TMP/test.env.orig" "$GROKBOT_HOOKS_DIR/test.env"
+printf 'GROKBOT_SKIP_WORKTREE_MISSING=0\n' >> "$GROKBOT_HOOKS_DIR/test.env"
 run sweep; count 12
+cp "$TMP/test.env.orig" "$GROKBOT_HOOKS_DIR/test.env"
 jq -e 'select(.status | startswith("worktree_missing "))' "$CALLS" >/dev/null
 run sweep; count 12
 # A crashed lock holder must not block later runs.
