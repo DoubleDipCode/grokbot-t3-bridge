@@ -130,7 +130,7 @@ GROKBOT_INSTANT_APPROVAL=0
 ```
 
 - The line must be exactly that: no `export`, quotes, spaces or trailing comment. Without it (or with any other value) every ping is sent, as before.
-- It drops only `codex-permission` pings, including those for sub-threads routed to this bot. `notify.log` shows `<bot> codex-permission skipped (instant approvals off)`. A skipped ping also does not update the thread registry. `claude-notify` pings are still sent.
+- It drops only `codex-permission` pings, including those for sub-threads routed to this bot. `notify.log` shows `<bot> codex-permission skipped (instant approvals off)`. A skipped ping also does not update the thread registry and is not recorded in Atoll. `claude-notify` pings are still sent.
 - Requests that are really waiting in T3 are still reported by the [pending-approvals sweep](#the-pending-approvals-sweep), after `GROKBOT_APPROVAL_MINUTES` (default 10). The sweep runs with other hook runs or from the optional launchd job, so install that job if nothing else may be running.
 - Do not use it where the sweep cannot see the prompt: Codex outside T3, `GROKBOT_APPROVAL_MINUTES=0`, `GROKBOT_REGISTRY=0` or `GROKBOT_T3_DB_LOOKUP=0`.
 - `set-webhook.sh` rewrites the env file, so add the line again after you run it.
@@ -196,6 +196,20 @@ This is the safety net for prompts that no hook reported: a harness whose config
 7. POSTs the payload in the background with a 10-second timeout, and logs the HTTP status code.
 
 It never prints to stdout and always exits 0, so it cannot block or change the agent's turn. It also rotates `notify.log` once it passes about 1 MB.
+
+### Turning off `worktree_missing` pings for one bot
+
+A cleanup that removes many worktrees wakes the bot once per worktree. To stop these pings for one bot, add this line to `~/.grokbot-hooks/<bot>.env`:
+
+```text
+GROKBOT_SKIP_WORKTREE_MISSING=1
+```
+
+- The line must be exactly that. Without it every `worktree_missing` ping is sent, as before.
+- It applies to sweeps and to turn ends. A thread that removes its own marker or worktree before its turn ends then sends nothing at all, also not its final result. Do not use it for a bot that depends on that fallback.
+- Nothing else happens for such an event: no Atoll record, and the thread registry is not updated, so `my_open_threads` can keep showing the last status.
+- `notify.log` shows `<bot> worktree_missing skipped <worktree>` once per worktree; a `.wm-skipped` file in the state directory remembers it.
+- `set-webhook.sh` rewrites the env file, so add the line again after you run it.
 
 ### Why the marker map exists
 
@@ -312,6 +326,7 @@ What the log lines mean:
 | `... status=worktree_missing worktree /path ...` | Known worktree, marker gone. The bot was notified and should read the thread. |
 | `... codex bot=codexbot branch=... status=done` | Hook ran in a bot worktree. |
 | `... codexbot webhook http=200` | Callback delivered. |
+| `... codexbot worktree_missing skipped /path` | The env file has `GROKBOT_SKIP_WORKTREE_MISSING=1`, so this ping was [not sent](#turning-off-worktree_missing-pings-for-one-bot). Logged once per worktree. |
 | `... codexbot codex-permission skipped (instant approvals off)` | The env file has `GROKBOT_INSTANT_APPROVAL=0`, so this instant ping was [not sent](#turning-off-the-instant-codex-pings-for-one-bot). |
 | `... codexbot webhook http=401` | Wrong or missing Authorization value. Run `set-webhook.sh` again. In OpenBot mode (`mode=openbot` at the end of the line): wrong signing secret, or the Mac's clock is more than 5 minutes off. |
 | `... codexbot webhook http=202 result=0 mode=openbot` | OpenBot accepted the callback (`http=200` there: it had that delivery id already). |

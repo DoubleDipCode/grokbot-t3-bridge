@@ -175,6 +175,15 @@ Each callback names the T3 thread it belongs to. The hook finds it from the `T3C
 
 So the routine can go straight to `t3_thread_read` with `thread_id` and answer "which of my threads are open" from the payload, with no `t3_thread_list` or `t3_thread_search`. Nobody writes registry entries by hand. Old payload fields are unchanged. Details, fallbacks and risks (the Codex lookup reads T3's internal storage): [docs/hooks.md](docs/hooks.md#thread-registry).
 
+## Per-bot options
+
+Two optional lines in `~/.grokbot-hooks/<bot>.env` stop pings that only add noise. Both are off by default. Each line must be exactly as shown (no `export`, quotes, spaces or trailing comment). `set-webhook.sh` rewrites the file, so add the lines again after you run it.
+
+| Line | What it stops | What still arrives | Use it when |
+| --- | --- | --- | --- |
+| `GROKBOT_INSTANT_APPROVAL=0` | The instant `codex-permission` pings. | `claude-notify` pings, and the [pending-approvals sweep](#delegated-sub-threads-and-t3s-own-list-of-pending-approvals) for requests that really wait in T3. [Limits](docs/hooks.md#turning-off-the-instant-codex-pings-for-one-bot). | The bot's T3 threads run in Auto mode, where this hook also fires for requests that T3 approves itself. |
+| `GROKBOT_SKIP_WORKTREE_MISSING=1` | Every [`worktree_missing`](#actionable-status-and-stall-checks) ping, from sweeps and from turn ends. | Pings for worktrees that still have their marker. [Limits](docs/hooks.md#turning-off-worktree_missing-pings-for-one-bot). | A cleanup removes many worktrees, and each one would wake the bot. |
+
 ## Approval-prompt pings
 
 A thread blocked on a permission prompt has not ended its turn, so Stop never fires. Two more hooks ping the bot while the prompt is open, with status `needs_input approval <summary>`:
@@ -184,7 +193,7 @@ A thread blocked on a permission prompt has not ended its turn, so Stop never fi
 
 `install.sh` registers them: `Notification` in every Claude config dir it finds (see [Configuration](#configuration)) and `PermissionRequest` in `~/.codex/hooks.json`. It also registers the `UserPromptSubmit` turn-start hooks for [dead turns](#dead-turns); like every Codex hook, the Codex one must be trusted in `/hooks`. These pings always send (no dedupe) and never touch `.grokbot-status`. A bot cannot answer the prompt; it should tell the human.
 
-**Bots that run T3 threads in Auto mode:** add the line `GROKBOT_INSTANT_APPROVAL=0` to `~/.grokbot-hooks/<bot>.env`. This drops the instant `codex-permission` pings, which also fire for requests that T3 approves itself. The [pending-approvals sweep](#delegated-sub-threads-and-t3s-own-list-of-pending-approvals) still reports requests that really wait. Without the line nothing changes. Limits: [docs/hooks.md](docs/hooks.md#turning-off-the-instant-codex-pings-for-one-bot).
+A bot can turn off the instant Codex pings: see [Per-bot options](#per-bot-options).
 
 As a fallback, the sweep sends `stalled <N>m approval? <status>` when a harness is running in a marked worktree but nothing has changed for `GROKBOT_STALL_MINUTES` (default 45). Details: [docs/hooks.md](docs/hooks.md#approval-prompt-pings).
 

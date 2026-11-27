@@ -326,6 +326,13 @@ else
   fi
   ROUTE=map
   STATUS="worktree_missing worktree $ROOT no longer has a marker (deleted or moved); read the thread for its real state"
+  # Per-bot opt-out: GROKBOT_SKIP_WORKTREE_MISSING=1 in <bot>.env drops these pings (a cleanup that removes
+  # many worktrees otherwise wakes the bot once per worktree). Logged once per worktree.
+  if grep -qx 'GROKBOT_SKIP_WORKTREE_MISSING=1' "$DIR/$BOT.env" 2>/dev/null; then
+    _wmk="$STATE/$(printf '%s' "$ROOT" | shasum -a 256 | awk '{print $1}').wm-skipped"
+    [ -f "$_wmk" ] || { echo "$TS $BOT worktree_missing skipped $ROOT" >> "$LOG"; touch "$_wmk"; }
+    return 0
+  fi
 fi
 
 KEY="$(printf '%s' "$ROOT" | shasum -a 256 | awk '{print $1}')"
